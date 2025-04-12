@@ -1,4 +1,4 @@
-```markdown
+
 # Маша v2 - Telegram Чат-Бот на Gemini и ChromaDB
 
 Этот проект представляет собой многофункционального Telegram чат-бота по имени **Маша**, построенного с использованием Python,
@@ -71,11 +71,14 @@
     ```
 
 3.  **Установите зависимости:**
-    ```bash
+    ```
+    bash
     pip install --upgrade pip
+    ```
     # Установите зависимости из файла, если он есть:
     # pip install -r requirements.txt
     # Или установите вручную:
+    ```
     pip install python-telegram-bot google-generativeai Pillow python-dotenv chromadb sentence-transformers pydub speechrecognition transformers torch torchvision torchaudio accelerate jsonschema
     ```
     *(Установка `torch` может потребовать специфичной команды для вашей системы/CUDA, см. [pytorch.org](https://pytorch.org/))*
@@ -84,7 +87,10 @@
 
 1.  **Создайте файл `.env`** в корневой директории проекта.
 2.  **Заполните файл `.env` вашими данными:**
-    ```dotenv
+
+   
+    dotenv
+    ```
     TELEGRAM_BOT_TOKEN=ВАШ_ТЕЛЕГРАМ_ТОКЕН
     GEMINI_API_KEY=ВАШ_GOOGLE_GEMINI_API_KEY
     ADMIN_IDS=ID_АДМИН_1,ID_АДМИН_2 # Через запятую, без пробелов
@@ -101,7 +107,8 @@
 
 ### Запуск бота
 
-```bash
+```
+bash
 python main.py
 ```
 
