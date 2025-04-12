@@ -6,10 +6,7 @@
 **Имя бота:** Маша (настраиваемое через `.env`)
 
 [![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) <!-- Если вы выберете MIT лицензию -->
-<!-- [![Issues](https://img.shields.io/github/issues/ByteBudda/mashav2)](https://github.com/ByteBudda/mashav2/issues) -->
-<!-- [![Forks](https://img.shields.io/github/forks/ByteBudda/mashav2)](https://github.com/ByteBudda/mashav2/network/members) -->
-<!-- [![Stars](https://img.shields.io/github/stars/ByteBudda/mashav2)](https://github.com/ByteBudda/mashav2/stargazers) -->
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) 
 
 ## 🌟 Возможности
 
