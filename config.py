@@ -16,7 +16,7 @@ load_dotenv(dotenv_path=env_path)
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 ADMIN_USER_IDS = list(map(int, os.getenv('ADMIN_IDS', '').split(','))) if os.getenv('ADMIN_IDS') else []
-
+PINECONE_API_KEY = os.getenv('PINECONE_API_KEY')
 # --- Настройка логирования ---
 # Определяем логгер на верхнем уровне
 logger = logging.getLogger(__name__)
