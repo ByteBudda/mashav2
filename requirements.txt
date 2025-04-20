@@ -1,10 +1,24 @@
-python-telegram-bot==20.3
-pydub==0.25.1
-Pillow==10.0.0
-chromadb==0.3.2
-sentence-transformers==2.2.2
-transformers==4.33.3
-python-dotenv==1.0.0
-mistralai==1.0.0  # Assuming MistralAI is used
-speechrecognition==3.8.1
-aiosqlite==0.19.0  
+# Telegram Bot Framework
+python-telegram-bot
+
+# LLM APIs
+google-generativeai
+mistralai
+
+# Vector Database & Embeddings
+chromadb              # Клиент ChromaDB. БД должна быть внешней для Vercel!
+sentence-transformers # Для эмбеддингов. Требует torch или tensorflow.
+transformers          # Для токенизатора и sentence-transformers.
+torch                 # Бэкенд для sentence-transformers/transformers.
+sentencepiece         # Часто требуется для токенизаторов.
+
+# Audio Processing
+# ВНИМАНИЕ: pydub НЕ БУДЕТ работать на Vercel без установки ffmpeg!
+pydub
+SpeechRecognition     # Для транскрипции (использует внешние API).
+
+# Image Processing
+Pillow
+
+# Environment Variables Helper (полезно для локальной разработки)
+python-dotenv
