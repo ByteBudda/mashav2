@@ -1,0 +1,10 @@
+python-dotenv==1.0.0
+pyTelegramBotAPI==4.15.0
+google-generativeai==0.3.2
+speech-recognition==3.10.0
+Pillow==10.2.0
+pydub==0.25.1
+chromadb==0.4.23
+sentence-transformers==2.2.2
+transformers==4.38.2
+mistralai==0.0.10
