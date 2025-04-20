@@ -8,3 +8,4 @@ chromadb==0.4.23
 sentence-transformers==2.2.2
 transformers==4.38.2
 mistralai==0.0.10
+ffmpeg
