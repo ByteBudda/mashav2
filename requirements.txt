@@ -6,14 +6,14 @@ google-generativeai
 mistralai
 
 # Vector Database & Embeddings
-chromadb              # Клиент ChromaDB. БД должна быть внешней для Vercel!
-sentence-transformers # Для эмбеддингов. Требует torch или tensorflow.
+chromadb              # Клиент ChromaDB.
+sentence-transformers # Для эмбеддингов
 transformers          # Для токенизатора и sentence-transformers.
 torch                 # Бэкенд для sentence-transformers/transformers.
 sentencepiece         # Часто требуется для токенизаторов.
 
 # Audio Processing
-# ВНИМАНИЕ: pydub НЕ БУДЕТ работать на Vercel без установки ffmpeg!
+# ВНИМАНИЕ: pydub НЕ БУДЕТ работать  без установки ffmpeg!
 pydub
 SpeechRecognition     # Для транскрипции (использует внешние API).
 
