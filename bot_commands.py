@@ -1,386 +1,504 @@
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+# -*- coding: utf-8 -*-
+# bot_commands.py
+import asyncio
+import re # Импортируем re для экранирования
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile, constants
 from telegram.ext import ContextTypes, CallbackContext, CommandHandler, CallbackQueryHandler, filters
-import logging # logger получается из config
+import logging
 import os
 from functools import wraps
-from typing import Any, Dict # Для type hints, опционально
+from typing import Any, Optional, List, Dict # Добавили Dict
+from collections import deque
+import time
+import sqlite3 # Для get_banned_users type hint
 
-# Импорты из проекта
-from config import BOT_NAME, DEFAULT_STYLE, SYSTEM_ROLE, USER_ROLE, ASSISTANT_ROLE, HISTORY_TTL, logger, ADMIN_USER_IDS, settings
-from state import (add_to_history, user_preferred_name, # Убрали chat_history, last_activity
-                   group_user_style_prompts, bot_activity_percentage, user_topic)
-# Импортируем функцию из vector_store
-from vector_store import delete_history # Переименовываем для ясности или используем как есть
+# Используем настройки и константы из config
+from config import logger, ADMIN_USER_IDS, settings, SYSTEM_ROLE, USER_ROLE, ASSISTANT_ROLE
 
-user_info_db: Dict[int, Dict[str, Any]] = {}
+# Импортируем функции работы с состоянием/БД
+from state import (
+    add_to_memory_history, chat_history, last_activity, # In-memory state
+    set_user_preferred_name_in_db, get_user_info_from_db, # User DB functions
+    bot_activity_percentage, save_bot_settings_to_db, # Bot state/settings
+    get_db_connection, _execute_db, # DB helpers
+    set_group_user_style_in_db, delete_group_user_style_in_db, # User-group style DB
+    set_group_style_in_db, delete_group_style_in_db, # Group style DB
+    ban_user_in_db, unban_user_in_db, is_user_banned, get_banned_users # Ban DB functions
+)
+# Импорт синхронных функций удаления эмбеддингов
+from vector_db import (
+    delete_embeddings_by_sqlite_ids_sync,
+    delete_facts_by_history_key_sync,
+    delete_fact_embeddings_by_ids_sync # Пока не используется напрямую здесь
+)
 
-# ==============================================================================
-# Начало: Содержимое bot_commands.py
-# ==============================================================================
 
-# --- Декораторы ---
+# --- Вспомогательная функция экранирования ---
+def escape_markdown_v2(text: str) -> str:
+    """Экранирует все зарезервированные символы MarkdownV2."""
+    if not isinstance(text, str): text = str(text) # На случай, если передали не строку
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
+# --- Декоратор проверки админа ---
 def admin_only(func):
-    """Декоратор для проверки прав администратора."""
+    """Декоратор для проверки, является ли пользователь админом бота."""
     @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update or not update.effective_user or update.effective_user.id not in ADMIN_USER_IDS:
-            if update and update.message:
-                await update.message.reply_text("🚫 У вас нет прав для выполнения этой команды.")
-            elif update and update.callback_query:
-                 await update.callback_query.answer("🚫 Недостаточно прав!", show_alert=True)
-            logger.warning(f"Unauthorized access attempt by user {update.effective_user.id if update.effective_user else 'Unknown'}")
-            return
-        return await func(update, context)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        if not user or user.id not in ADMIN_USER_IDS:
+            msg = "🚫 У вас нет прав\\."
+            if update.message: await update.message.reply_text(msg, parse_mode='MarkdownV2')
+            elif update.callback_query: await update.callback_query.answer("🚫 Нет прав!", show_alert=True)
+            logger.warning(f"Unauthorized admin command attempt by user {user.id if user else 'Unknown'}")
+            return None
+        return await func(update, context, *args, **kwargs)
     return wrapper
 
 # --- Команды бота ---
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    # Используем имя из настроек
-    await update.message.reply_text(
-        f"Привет, {user.first_name}! Я - {settings.BOT_NAME}, давай поболтаем?"
-    )
+    """Обработчик команды /start."""
+    user = update.effective_user; msg = update.message
+    if not user or not msg: return
+    uname = escape_markdown_v2(user.first_name or f"User_{user.id}")
+    bname = escape_markdown_v2(settings.BOT_NAME)
+    await msg.reply_text(f"Привет, {uname}\\! Я *{bname}*\\. Чем могу помочь?", parse_mode='MarkdownV2')
+    logger.info(f"User {user.id} started the bot.")
+
 
 async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавляет важное системное сообщение в историю (ChromaDB)."""
-    user = update.effective_user
-    chat = update.effective_chat
-    if not user or not chat: return
-    user_id = user.id
-
-    history_key = chat.id if chat.type in ['group', 'supergroup'] else user.id
+    """Обработчик команды /remember <текст>."""
+    user = update.effective_user; chat = update.effective_chat; msg = update.message
+    if not user or not chat or not msg: return
+    history_key = chat.id if chat.type != 'private' else user.id
 
     if context.args:
         memory = " ".join(context.args).strip()
         if memory:
-            user_info_db.setdefault(user_id, {"preferences": {}, "memory": None})
-            user_info_db[user_id]['memory'] = memory
-            await update.message.reply_text(f"Хорошо, я запомнила это о вас: '{memory}'.")
-            logger.info(f"User {user.id} updated memory: '{memory[:50]}...'")
-        else:
-             await update.message.reply_text("Пожалуйста, укажите непустой текст для запоминания.")
-    else:
-        # Показываем текущую запомненную информацию, если она есть
-        current_memory = user_info_db.get(user_id, {}).get('memory')
-        if current_memory:
-             await update.message.reply_text(f"Я помню о вас следующее: '{current_memory}'.\nЧтобы изменить, используйте `/remember новый текст`.")
-        else:
-             await update.message.reply_text("Пожалуйста, укажите, что нужно запомнить после команды /remember.")
+            sys_msg = f"Важное напоминание от пользователя: {memory}"
+            add_to_memory_history(history_key, SYSTEM_ROLE, sys_msg)
+            # Не сохраняем системные сообщения в векторную БД по умолчанию
+            await msg.reply_text(f"📝 Запомнила: '{escape_markdown_v2(memory)}'\\.", parse_mode='MarkdownV2')
+            logger.info(f"User {user.id} added memory for key {history_key}: '{memory[:50]}...'")
+        else: await msg.reply_text("Напоминание не может быть пустым\\.", parse_mode='MarkdownV2')
+    else: await msg.reply_text("Что мне нужно запомнить\\?", parse_mode='MarkdownV2')
+
 
 async def clear_my_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запрашивает подтверждение на очистку истории пользователя."""
-    user_id = update.effective_user.id
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Да, очистить", callback_data=f'clear_vector_history_{user_id}'),
-          InlineKeyboardButton("Нет, отмена", callback_data='cancel')]]
-    )
-    await update.message.reply_text("Вы уверены, что хотите полностью очистить свою историю чата (это необратимо)?", reply_markup=keyboard)
+    """Предлагает пользователю подтвердить очистку его личной истории."""
+    user = update.effective_user; msg = update.message
+    if not user or not msg: return
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Да, очистить", callback_data=f'confirm_clear_my_history_{user.id}'),
+                                      InlineKeyboardButton("Нет, отмена", callback_data='cancel_clear')]])
+    await msg.reply_text("Вы уверены, что хотите очистить вашу историю переписки\\?\nЭто необратимо\\.", reply_markup=keyboard, parse_mode='MarkdownV2')
+
 
 async def button_callback(update: Update, context: CallbackContext):
-    """Обрабатывает нажатия на инлайн-кнопки."""
+    """Обработчик нажатий на инлайн-кнопки (только для очистки истории)."""
     query = update.callback_query
-    if not query or not query.data: return
-    await query.answer() # Отвечаем на колбэк, чтобы кнопка перестала "грузиться"
-    data = query.data
+    if not query or not query.from_user: return
+    await query.answer()
+    data = query.data; user_id = query.from_user.id
 
-    if data.startswith('clear_vector_history_'):
-        user_id_str = data.split('_')[-1]
-        if not user_id_str.isdigit():
-             await query.edit_message_text("Ошибка: Неверный ID пользователя в данных кнопки.")
-             logger.error(f"Invalid user ID in callback data: {data}")
-             return
-        user_id_to_clear = int(user_id_str)
+    if data.startswith('confirm_clear_my_history_'):
+        target_user_id = int(data.split('_')[-1])
+        if user_id == target_user_id:
+            history_key = user_id # Личная история
+            history_cleared = False; db_cleared = None; deleted_sqlite_ids = []
 
-        if user_id_to_clear == query.from_user.id:
-            history_key = user_id_to_clear # Для ЛС ключ = user_id
-            logger.info(f"User {query.from_user.id} confirmed clearing history for key {history_key}")
-            # Вызываем асинхронное удаление из vector_store
-            deleted = await delete_history(history_key)
-            if deleted:
-                 await query.edit_message_text("✅ Ваша история чата очищена.")
-                 # Очищаем связанные данные
-                 if history_key in user_topic:
-                     del user_topic[history_key]
-                     logger.info(f"Cleared topic for user {history_key}")
-            else:
-                 await query.edit_message_text("⚠️ Не удалось очистить историю. Попробуйте позже или обратитесь к администратору.")
-        else:
-            await query.edit_message_text("🚫 Вы не можете очистить историю другого пользователя.")
-            logger.warning(f"User {query.from_user.id} tried to clear history for user {user_id_to_clear}")
-    elif data == 'cancel':
-        await query.edit_message_text("Действие отменено.")
-    else:
-         logger.warning(f"Received unknown callback data: {data}")
-         await query.edit_message_text("Неизвестное действие.")
+            if history_key in chat_history: del chat_history[history_key]; history_cleared = True
+            if history_key in last_activity: del last_activity[history_key]
+
+            conn = None
+            try:
+                conn = get_db_connection(); cursor = conn.cursor()
+                cursor.execute("SELECT id FROM history WHERE history_key = ?", (history_key,))
+                deleted_sqlite_ids = [row['id'] for row in cursor.fetchall()]
+                if deleted_sqlite_ids:
+                    p = ','.join('?' * len(deleted_sqlite_ids))
+                    cursor.execute(f"DELETE FROM history WHERE id IN ({p})", tuple(deleted_sqlite_ids))
+                    db_cleared = cursor.rowcount; conn.commit()
+                else: db_cleared = 0
+            except sqlite3.Error as e:
+                logger.error(f"Error clearing SQLite history for {history_key}: {e}", exc_info=True); db_cleared = None
+                if conn:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+            finally:
+                if conn: conn.close()
+
+            if db_cleared is None: await query.edit_message_text("Ошибка очистки истории из БД\\."); return
+
+            # Очистка из ChromaDB
+            if deleted_sqlite_ids:
+                logger.info(f"Deleting {len(deleted_sqlite_ids)} history embeddings from ChromaDB for key {history_key}...")
+                await asyncio.to_thread(delete_embeddings_by_sqlite_ids_sync, history_key, deleted_sqlite_ids)
+                 # Также удаляем связанные факты
+                logger.info(f"Deleting facts for key {history_key}...")
+                await asyncio.to_thread(delete_facts_by_history_key_sync, history_key)
+
+            if history_cleared or db_cleared > 0:
+                logger.info(f"User {user_id} cleared history (mem: {history_cleared}, db: {db_cleared} rows)."); await query.edit_message_text("✅ История чата очищена\\.")
+            else: await query.edit_message_text("История чата уже была пуста\\.")
+        else: await query.edit_message_text("🚫 Нельзя очистить чужую историю\\."); logger.warning(f"User {user_id} tried clearing history for {target_user_id}.")
+
+    elif data == 'cancel_clear': await query.edit_message_text("Действие отменено\\.")
 
 
 async def set_my_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Устанавливает предпочитаемое имя пользователя."""
-    user_id = update.effective_user.id
+    user = update.effective_user; msg = update.message
+    if not user or not msg: return
     if context.args:
         name = " ".join(context.args).strip()
-        if 2 <= len(name) <= 50: # Добавим валидацию имени
-            user_preferred_name[user_id] = name
-            # Обновим user_info_db тоже, если он там есть
-            if user_id in user_info_db:
-                user_info_db[user_id]['preferred_name_set_by_user'] = name # Отметка, что задано пользователем
-            await update.message.reply_text(f"Отлично, теперь буду обращаться к вам как '{name}'.")
-            logger.info(f"User {user_id} set preferred name to '{name}'.")
-        else:
-            await update.message.reply_text("Имя должно быть от 2 до 50 символов.")
-    else:
-        current_name = user_preferred_name.get(user_id, update.effective_user.first_name)
-        await update.message.reply_text(f"Сейчас я обращаюсь к вам как '{current_name}'.\nЧтобы изменить, введите команду и новое имя: `/setmyname Новое Имя`")
-
-
-async def my_style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает текущий стиль общения бота (не реализовано изменение)."""
-    # TODO: Реализовать показ и изменение персонального стиля, если потребуется
-    style_info = f"Мой текущий глобальный стиль общения:\n{settings.DEFAULT_STYLE}\n\n(Персональные стили пока не настраиваются)."
-    await update.message.reply_text(style_info)
-
-async def error_handler(update: object, context: CallbackContext):
-    """Логирует ошибки и уведомляет администратора."""
-    logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
-
-    # Попытка получить детали из update, если он есть
-    update_details = "N/A"
-    if isinstance(update, Update) and update.effective_message:
-        update_details = f"Update ID: {update.update_id}, Chat ID: {update.effective_chat.id}, User ID: {update.effective_user.id}"
-    elif isinstance(update, dict): # Иногда update приходит как словарь
-         update_details = f"Update (dict): {str(update)[:200]}..."
-
-    error_msg = f"Error: {type(context.error).__name__}: {context.error}\nUpdate details: {update_details}"
-
-    # Уведомление администратора (если есть)
-    if ADMIN_USER_IDS:
-        try:
-            # Отправляем только первому админу для простоты
-            await context.bot.send_message(
-                chat_id=ADMIN_USER_IDS[0],
-                text=f"⚠️ Произошла ошибка в боте:\n\n{error_msg[:3000]}" # Ограничиваем длину сообщения
-            )
-            logger.info(f"Error notification sent to admin {ADMIN_USER_IDS[0]}.")
-        except Exception as e:
-            logger.error(f"Failed to send error notification to admin: {e}")
-
-    # Можно добавить ответ пользователю, но осторожно, чтобы не спамить при повторяющихся ошибках
-    # if isinstance(update, Update) and update.effective_message:
-    #     try:
-    #         await update.effective_message.reply_text("Ой! Что-то пошло не так. Администратор уведомлен.")
-    #     except Exception:
-    #         logger.error("Failed to send error message to user.")
-
-
-# --- Административные команды ---
-
-@admin_only
-async def set_group_user_style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Устанавливает индивидуальный стиль для пользователя в группе (ответ на сообщение)."""
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Пожалуйста, используйте эту команду как ответ на сообщение пользователя, для которого хотите установить стиль.")
-        return
-    if not context.args:
-        await update.message.reply_text("Пожалуйста, укажите стиль общения после команды.")
-        return
-
-    target_user = update.message.reply_to_message.from_user
-    chat_id = update.effective_chat.id
-    style_prompt = " ".join(context.args).strip()
-
-    if not style_prompt:
-         await update.message.reply_text("Стиль не может быть пустым.")
-         return
-
-    key = (chat_id, target_user.id)
-    group_user_style_prompts[key] = style_prompt
-    await update.message.reply_text(f"✅ Установлен индивидуальный стиль общения для пользователя {target_user.first_name} ({target_user.id}) в этом чате.")
-    logger.info(f"Admin {update.effective_user.id} set group user style for user {target_user.id} in chat {chat_id}.")
-
-@admin_only
-async def reset_style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сбрасывает глобальный стиль на значение по умолчанию из .env."""
-    # Загружаем стиль из .env снова
-    original_default_style = os.getenv('DEFAULT_STYLE', "Ты - дружелюбный помощник.")
-    settings.update_default_style(original_default_style)
-    await update.message.reply_text(f"Глобальный стиль общения бота сброшен на стандартный (из .env):\n{settings.DEFAULT_STYLE}")
-    logger.info(f"Admin {update.effective_user.id} reset global style to default.")
-
-
-@admin_only
-async def clear_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Очищает историю чата (ChromaDB коллекцию) для указанного user ID."""
-    if context.args:
-        user_id_str = context.args[0]
-        if not user_id_str.isdigit():
-            await update.message.reply_text("Пожалуйста, укажите корректный ID пользователя (число).")
-            return
-
-        user_id_to_clear = int(user_id_str)
-        # В админской команде мы обычно чистим историю ЛС пользователя
-        history_key = user_id_to_clear
-        logger.info(f"Admin {update.effective_user.id} requested clearing history for key {history_key}")
-
-        deleted = await delete_history(history_key)
-        if deleted:
-            await update.message.reply_text(f"✅ История чата для пользователя {user_id_to_clear} очищена.")
-            if history_key in user_topic: del user_topic[history_key]
-        else:
-            await update.message.reply_text(f"⚠️ Не удалось очистить историю для {user_id_to_clear} (возможно, она уже пуста или произошла ошибка).")
-    else:
-        await update.message.reply_text("Пожалуйста, укажите ID пользователя (число) после команды `/clear_history`.")
-
-
-@admin_only
-async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает список ID администраторов."""
-    if ADMIN_USER_IDS:
-        admin_list = ", ".join(map(str, ADMIN_USER_IDS))
-        await update.message.reply_text(f"Список ID администраторов бота: {admin_list}")
-    else:
-        await update.message.reply_text("Список администраторов пуст (не задан в .env).")
-
-@admin_only
-async def get_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет файл логов администратору."""
-    log_filename = "bot.log" # Имя файла из настроек логгера
-    try:
-        if os.path.exists(log_filename) and os.path.getsize(log_filename) > 0:
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=InputFile(log_filename),
-                caption=f"Файл логов {log_filename}"
-            )
-            logger.info(f"Log file sent to admin {update.effective_user.id}.")
-        else:
-            await update.message.reply_text(f"Файл логов '{log_filename}' не найден или пуст.")
-    except Exception as e:
-        await update.message.reply_text(f"Произошла ошибка при отправке логов: {e}")
-        logger.error(f"Error sending log file: {e}", exc_info=True)
-
-@admin_only
-async def ban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Заглушка для команды бана."""
-    # TODO: Реализовать логику бана (например, добавление ID в "черный список")
-    await update.message.reply_text("Функция бана пока не реализована.")
-    logger.warning("Ban command called but not implemented.")
-
-
-@admin_only
-async def set_default_style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Устанавливает новый глобальный стиль общения бота."""
-    if context.args:
-        new_style = " ".join(context.args).strip()
-        if new_style:
-            settings.update_default_style(new_style)
-            await update.message.reply_text(f"✅ Глобальный стиль общения бота установлен на:\n{settings.DEFAULT_STYLE}")
-            logger.info(f"Admin {update.effective_user.id} set new global style.")
-        else:
-            await update.message.reply_text("Стиль не может быть пустым.")
-    else:
-        await update.message.reply_text(f"Текущий стиль:\n{settings.DEFAULT_STYLE}\n\nЧтобы изменить, введите `/setdefaultstyle Новый стиль общения`")
-
-
-@admin_only
-async def set_bot_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Устанавливает новое имя бота."""
-    if context.args:
-        new_name = " ".join(context.args).strip()
-        if 1 <= len(new_name) <= 50:
-            settings.update_bot_name(new_name)
-            await update.message.reply_text(f"✅ Имя бота установлено на: {settings.BOT_NAME}")
-            logger.info(f"Admin {update.effective_user.id} set bot name to '{settings.BOT_NAME}'.")
-        else:
-            await update.message.reply_text("Имя бота должно быть от 1 до 50 символов.")
-    else:
-        await update.message.reply_text(f"Текущее имя бота: {settings.BOT_NAME}\nЧтобы изменить, введите `/setbotname НовоеИмя`")
-
-@admin_only
-async def set_activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Устанавливает процент активности бота в группах."""
-    global bot_activity_percentage # Убедимся, что изменяем глобальную переменную из state
-    if context.args:
-        try:
-            percentage = int(context.args[0])
-            if 0 <= percentage <= 100:
-                # Обновляем переменную в state
-                bot_activity_percentage = percentage
-                # Можно также сохранить это значение в файл knowledge (state.py это сделает при выходе)
-                await update.message.reply_text(f"✅ Активность бота в группах установлена на {percentage}%")
-                logger.info(f"Bot activity set to {percentage}% by admin {update.effective_user.id}")
-            else:
-                await update.message.reply_text("⚠️ Процент активности должен быть в диапазоне от 0 до 100.")
-        except ValueError:
-            await update.message.reply_text("⚠️ Пожалуйста, введите числовое значение процента (0-100).")
-    else:
-        await update.message.reply_text(f"Текущая активность бота в группах: {bot_activity_percentage}%\nЧтобы изменить, введите `/setactivity <число от 0 до 100>`")
+        if name: await asyncio.to_thread(set_user_preferred_name_in_db, user.id, name); await msg.reply_text(f"Хорошо, {escape_markdown_v2(name)}\\!", parse_mode='MarkdownV2')
+        else: await msg.reply_text("Имя не может быть пустым\\.", parse_mode='MarkdownV2')
+    else: await msg.reply_text("Как вас называть\\?", parse_mode='MarkdownV2')
 
 
 async def reset_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сбрасывает контекст разговора (удаляет историю из ChromaDB)."""
-    user = update.effective_user
-    chat = update.effective_chat
-    if not user or not chat: return
+    """Сбрасывает контекст (историю в памяти) текущего чата."""
+    user = update.effective_user; chat = update.effective_chat; msg = update.message
+    if not user or not chat or not msg: return
+    history_key = chat.id if chat.type != 'private' else user.id
 
-    chat_type = chat.type
-    history_key = chat.id if chat_type in ['group', 'supergroup'] else user.id
-    logger.info(f"User {user.id} requested context reset for key {history_key}")
-
-    deleted = await delete_history(history_key)
-    if deleted:
-        await update.message.reply_text("Контекст разговора сброшен (история удалена). Можем начать заново.")
-        # Очищаем связанные данные для этого ключа
-        if history_key in user_topic: del user_topic[history_key]
-        # Очистка стилей для группы (опционально)
-        if chat_type != 'private':
-            keys_to_del = [k for k in group_user_style_prompts if k[0] == history_key]
-            deleted_styles_count = 0
-            for k in keys_to_del:
-                try:
-                    del group_user_style_prompts[k]
-                    deleted_styles_count += 1
-                except KeyError: pass
-            if deleted_styles_count > 0:
-                 logger.info(f"Cleared {deleted_styles_count} group user styles for chat_id {history_key} during context reset.")
-    else:
-        await update.message.reply_text("⚠️ Не удалось сбросить контекст (возможно, он уже пуст или произошла ошибка).")
+    if history_key in chat_history:
+        chat_history[history_key].clear(); logger.info(f"User {user.id} reset context for key {history_key}.")
+        await msg.reply_text("Начинаем с чистого листа\\!", parse_mode='MarkdownV2')
+    else: await msg.reply_text("Контекст и так пуст\\.", parse_mode='MarkdownV2')
 
 
 # --- Команда помощи ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает список доступных команд."""
-    user = update.effective_user
-    is_admin = user.id in ADMIN_USER_IDS
+    """Показывает справку по командам с использованием MarkdownV2."""
+    user = update.effective_user; msg = update.message
+    if not user or not msg: return
+    uname = escape_markdown_v2(user.first_name or f"User_{user.id}")
+    bname = escape_markdown_v2(settings.BOT_NAME)
 
-    user_commands_text = """
-*Основные команды:*
-/start - Начать общение
-/help - Показать это сообщение
-/setmyname <имя> - Установить ваше имя для общения
-/remember <текст> - Попросить меня запомнить важную информацию
-/reset_context - Сбросить текущий контекст разговора (удалить историю)
-/clear_my_history - Полностью очистить вашу историю чата (запросит подтверждение)
-"""
+    parts = [f"Привет, {uname}\\! Я *{bname}*\\. Вот команды:\n", "*Основные:*"]
+    user_cmds = { "/start": "Начать", "/help": "Помощь", "/remember <текст>": "Запомнить",
+                  "/clear_my_history": "Очистить мою историю", "/setmyname <имя>": "Мое имя", "/reset_context": "Сбросить диалог" }
+    for cmd, desc in user_cmds.items(): parts.append(f"`{escape_markdown_v2(cmd)}` \\- {escape_markdown_v2(desc)}\\.")
 
-    admin_commands_text = """
-*Административные команды:*
-/set_default_style <стиль> - Установить новый глобальный стиль общения
-/reset_style - Сбросить глобальный стиль на стандартный (из .env)
-/set_bot_name <имя> - Установить новое имя бота
-/set_activity <0-100> - Установить процент активности бота в группах
-/set_group_user_style [в ответ] <стиль> - Задать стиль для пользователя в группе
-/clear_history <user_id> - Очистить историю ЛС указанного пользователя
-/list_admins - Показать ID администраторов
-/get_log - Получить файл логов
-/ban [пока не работает] - Забанить пользователя
-"""
+    if user.id in ADMIN_USER_IDS:
+        parts.append("\n*Админские:*")
+        admin_cmds = { "/clear_history <ID>": "Очистить историю", "/set_default_style <стиль>": "Глобальный стиль",
+                       "/reset_style": "Сброс стиля", "/set_bot_name <имя>": "Имя бота", "/set_activity <%>": "% активности",
+                       "/set_group_style <стиль>": "Стиль группы", "/reset_group_style": "Сброс стиля группы",
+                       "/set_group_user_style": "\\(Ответ\\) Стиль юзера", "/reset_group_user_style": "\\(Ответ\\) Сброс стиля юзера",
+                       "/ban <ID/ответ> [причина]": "Забанить", "/unban <ID>": "Разбанить", "/list_banned": "Список банов",
+                       "/list_admins": "Админы", "/get_log": "Логи" }
+        for cmd, desc in admin_cmds.items(): parts.append(f"`{escape_markdown_v2(cmd)}` \\- {escape_markdown_v2(desc)}")
 
-    help_text = user_commands_text
-    if is_admin:
-        help_text += admin_commands_text
+    final_text = "\n".join(parts)
+    try: await msg.reply_text(final_text, parse_mode='MarkdownV2')
+    except Exception as e:
+        logger.error(f"Failed sending help MDv2: {e}. Sending plain.")
+        plain = re.sub(r'\\([_*\[\]()~`>#+\-=|{}.!])', r'\1', final_text) # Убираем экранирование
+        plain = plain.replace('*', '').replace('`', '') # Убираем остатки форматирования
+        try: await msg.reply_text(plain)
+        except Exception as fallback_e: logger.error(f"Failed sending plain help: {fallback_e}")
 
-    await update.message.reply_text(help_text, parse_mode='Markdown')
 
-# ==============================================================================
-# Конец: Содержимое bot_commands.py
-# ==============================================================================
+# --- Обработчик ошибок ---
+async def error_handler(update: object, context: CallbackContext):
+    """Логирует ошибки и отправляет уведомление админу."""
+    logger.error(f"Exception while handling update: {context.error}", exc_info=context.error)
+    chat_id, user_id, update_type = "N/A", "N/A", type(update).__name__
+    if isinstance(update, Update):
+        if update.effective_chat: chat_id = update.effective_chat.id
+        if update.effective_user: user_id = update.effective_user.id
+    err = context.error; err_type = escape_markdown_v2(type(err).__name__); err_msg = escape_markdown_v2(str(err))
+    full_msg = f"⚠️ *Ошибка*\n*Тип:* `{err_type}`\n*Ошибка:* `{err_msg}`\n*Update:* `{update_type}`\n*Chat:* `{chat_id}`\n*User:* `{user_id}`"
+    if ADMIN_USER_IDS:
+        try: await context.bot.send_message(ADMIN_USER_IDS[0], full_msg[:4090], parse_mode='MarkdownV2')
+        except Exception as e: logger.error(f"Failed sending error notification: {e}")
+
+
+# --- Административные команды (с декоратором @admin_only) ---
+
+@admin_only
+async def set_group_user_style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.reply_to_message: await msg.reply_text("Ответьте на сообщение: `/set_group_user_style <стиль>`"); return
+    if not context.args: await msg.reply_text("Укажите стиль\\."); return
+    target = msg.reply_to_message.from_user; style = " ".join(context.args).strip()
+    if not target or not style: await msg.reply_text("Ошибка данных/стиля\\."); return
+    success = await asyncio.to_thread(set_group_user_style_in_db, msg.chat_id, target.id, style)
+    if success: await msg.reply_text(f"✅ Стиль для {target.mention_markdown_v2()} установлен\\.", parse_mode='MarkdownV2'); logger.info(f"Admin {msg.from_user.id} set style for {target.id} in {msg.chat_id}.")
+    else: await msg.reply_text("❌ Ошибка установки стиля \\(БД\\)\\.", parse_mode='MarkdownV2')
+
+@admin_only
+async def reset_group_user_style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.reply_to_message: await msg.reply_text("Ответьте на сообщение: `/reset_group_user_style`"); return
+    target = msg.reply_to_message.from_user
+    if not target: await msg.reply_text("Ошибка данных\\."); return
+    success = await asyncio.to_thread(delete_group_user_style_in_db, msg.chat_id, target.id)
+    if success: await msg.reply_text(f"✅ Стиль для {target.mention_markdown_v2()} сброшен\\.", parse_mode='MarkdownV2'); logger.info(f"Admin {msg.from_user.id} reset style for {target.id} in {msg.chat_id}.")
+    else: await msg.reply_text("❌ Стиль не был установлен или ошибка БД\\.", parse_mode='MarkdownV2')
+
+@admin_only
+async def set_group_style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg=update.message; chat = update.effective_chat;
+    if not msg or not chat or chat.type == 'private': await msg.reply_text("Только для групп\\."); return
+    if not context.args: await msg.reply_text("Укажите стиль: `/set_group_style <стиль>`"); return
+    style = " ".join(context.args).strip()
+    if not style: await msg.reply_text("Стиль не пустой\\."); return
+    success = await asyncio.to_thread(set_group_style_in_db, chat.id, style)
+    if success: await msg.reply_text(f"✅ Стиль группы установлен\\."); logger.info(f"Admin {msg.from_user.id} set style for group {chat.id}.")
+    else: await msg.reply_text("❌ Ошибка установки стиля \\(БД\\)\\.")
+
+@admin_only
+async def reset_group_style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg=update.message; chat = update.effective_chat;
+    if not msg or not chat or chat.type == 'private': await msg.reply_text("Только для групп\\."); return
+    success = await asyncio.to_thread(delete_group_style_in_db, chat.id)
+    if success: await msg.reply_text(f"✅ Стиль группы сброшен\\."); logger.info(f"Admin {msg.from_user.id} reset style for group {chat.id}.")
+    else: await msg.reply_text("❌ Стиль не был установлен или ошибка БД\\.")
+
+@admin_only
+async def reset_style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg=update.message; user = update.effective_user
+    if not msg or not user: return
+    initial_style = settings._initial_default_style; settings.update_default_style(initial_style)
+    await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), bot_activity_percentage)
+    escaped = escape_markdown_v2(initial_style)
+    await msg.reply_text(f"✅ Глобальный стиль сброшен:\n```\n{escaped}\n```", parse_mode='MarkdownV2'); logger.info(f"Admin {user.id} reset global style.")
+
+@admin_only
+async def clear_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message; user = update.effective_user
+    if not msg or not user: return
+    if not context.args: await msg.reply_text("Укажите ID: `/clear_history <ID>`"); return
+    try: history_key = int(context.args[0])
+    except (ValueError, IndexError): await msg.reply_text("Укажите числовой ID\\."); return
+    history_cleared = False; db_cleared = None; deleted_sqlite_ids = []
+    if history_key in chat_history: del chat_history[history_key]; history_cleared = True
+    if history_key in last_activity: del last_activity[history_key]
+    conn = None
+    try:
+        conn = get_db_connection(); cursor = conn.cursor()
+        cursor.execute("SELECT id FROM history WHERE history_key = ?", (history_key,))
+        deleted_sqlite_ids = [r['id'] for r in cursor.fetchall()]
+        if deleted_sqlite_ids: p = ','.join('?'*len(deleted_sqlite_ids)); cursor.execute(f"DELETE FROM history WHERE id IN ({p})", tuple(deleted_sqlite_ids)); db_cleared = cursor.rowcount; conn.commit()
+        else: db_cleared = 0
+    except sqlite3.Error as e:
+        logger.error(f"Error clearing SQLite history {history_key}: {e}")
+        db_cleared = None
+        if conn:
+            conn.rollback()
+    finally:
+        if conn: conn.close()
+    if db_cleared is None: await msg.reply_text("❌ Ошибка очистки БД\\."); return
+    if deleted_sqlite_ids:
+        logger.info(f"Deleting {len(deleted_sqlite_ids)} history embeddings for {history_key}...")
+        await asyncio.to_thread(delete_embeddings_by_sqlite_ids_sync, history_key, deleted_sqlite_ids)
+        logger.info(f"Deleting facts for {history_key}...")
+        await asyncio.to_thread(delete_facts_by_history_key_sync, history_key)
+    hk_escaped = escape_markdown_v2(str(history_key))
+    if history_cleared or db_cleared > 0: await msg.reply_text(f"✅ История для `{hk_escaped}` очищена \\(память: {history_cleared}, БД: {db_cleared} rows\\)\\.", parse_mode='MarkdownV2'); logger.info(f"Admin {user.id} cleared history for {history_key}.")
+    else: await msg.reply_text(f"История для `{hk_escaped}` не найдена\\.", parse_mode='MarkdownV2')
+
+@admin_only
+async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message;
+    if not msg: return
+    if ADMIN_USER_IDS: admin_list = "\n".join(f"\\- `{aid}`" for aid in ADMIN_USER_IDS); await msg.reply_text(f"🔑 *Админы:*\n{admin_list}", parse_mode='MarkdownV2')
+    else: await msg.reply_text("Админы не заданы\\.")
+
+@admin_only
+async def get_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message; user = update.effective_user; chat = update.effective_chat
+    if not msg or not user or not chat: return
+    log_file = 'bot.log'
+    if os.path.exists(log_file) and os.path.getsize(log_file) > 0:
+        try:
+             await msg.reply_text("Отправляю файл логов\\.\\.\\.", parse_mode='MarkdownV2')
+             await context.bot.send_document(chat.id, InputFile(log_file), caption="`bot.log`")
+             logger.info(f"Admin {user.id} requested log file.")
+        except constants.NetworkError as e: logger.error(f"Net error sending log: {e}"); await msg.reply_text(f"❌ Сетевая ошибка: `{escape_markdown_v2(str(e))}`", parse_mode='MarkdownV2')
+        except Exception as e: logger.error(f"Failed sending log: {e}", exc_info=True); await msg.reply_text(f"❌ Ошибка: `{escape_markdown_v2(str(e))}`", parse_mode='MarkdownV2')
+    elif os.path.exists(log_file): await msg.reply_text("Файл `bot.log` пуст\\.", parse_mode='MarkdownV2')
+    else: await msg.reply_text("Файл `bot.log` не найден\\.", parse_mode='MarkdownV2')
+
+@admin_only
+async def ban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message; user = update.effective_user; chat = update.effective_chat
+    if not msg or not user or not chat: return
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else None; target_id = None; target_info = "пользователю"
+    if msg.reply_to_message:
+        target = msg.reply_to_message.from_user;
+        if not target: await msg.reply_text("Нет данных\\."); return
+        target_id = target.id; target_info = f"{target.mention_markdown_v2()}"
+    elif context.args:
+        try: target_id = int(context.args[0]); target_info = f"ID `{target_id}`"
+        except (ValueError, IndexError): await msg.reply_text("Укажите ID или ответьте: `/ban <ID> [причина]`"); return
+    else: await msg.reply_text("Укажите ID или ответьте: `/ban <ID> [причина]`"); return
+    if target_id == user.id: await msg.reply_text("Себя\\? Нет\\."); return
+    if target_id in ADMIN_USER_IDS: await msg.reply_text("Админа\\? Нет\\."); return
+    if await asyncio.to_thread(is_user_banned, target_id): await msg.reply_text(f"{target_info} уже забанен\\.", parse_mode='MarkdownV2'); return
+    success = await asyncio.to_thread(ban_user_in_db, target_id, reason)
+    if success:
+        reason_text = f" Причина: _{escape_markdown_v2(reason)}_" if reason else ""
+        reply_msg = f"✅ {target_info} забанен\\.{reason_text}"
+        await msg.reply_text(reply_msg, parse_mode='MarkdownV2'); logger.info(f"Admin {user.id} banned {target_id}. Reason: {reason}")
+        if chat.type != 'private':
+            try: await context.bot.ban_chat_member(chat.id, target_id); logger.info(f"Banned {target_id} in chat {chat.id}")
+            except Exception as e: logger.warning(f"Could not ban {target_id} in chat {chat.id}: {e}")
+    else: await msg.reply_text(f"❌ Ошибка бана {target_info} \\(БД\\)\\.", parse_mode='MarkdownV2')
+
+@admin_only
+async def unban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message; user = update.effective_user; chat = update.effective_chat
+    if not msg or not user or not chat: return
+    if not context.args: await msg.reply_text("Укажите ID: `/unban <ID>`"); return
+    try: target_id = int(context.args[0]); target_info = f"ID `{target_id}`"
+    except (ValueError, IndexError): await msg.reply_text("Укажите числовой ID\\."); return
+    if not await asyncio.to_thread(is_user_banned, target_id): await msg.reply_text(f"{target_info} не забанен\\.", parse_mode='MarkdownV2'); return
+    success = await asyncio.to_thread(unban_user_in_db, target_id)
+    if success:
+        await msg.reply_text(f"✅ {target_info} разбанен\\.", parse_mode='MarkdownV2'); logger.info(f"Admin {user.id} unbanned {target_id}.")
+        if chat.type != 'private':
+            try: await context.bot.unban_chat_member(chat.id, target_id, only_if_banned=True); logger.info(f"Unbanned {target_id} in chat {chat.id}")
+            except Exception as e: logger.warning(f"Could not unban {target_id} in chat {chat.id}: {e}")
+    else: await msg.reply_text(f"❌ Ошибка разбана {target_info} \\(БД\\)\\.", parse_mode='MarkdownV2')
+
+@admin_only
+async def list_banned_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message;
+    if not msg: return
+    banned_list: List[sqlite3.Row] = await asyncio.to_thread(get_banned_users)
+    if not banned_list: await msg.reply_text("Список банов пуст\\.", parse_mode='MarkdownV2'); return
+    parts = ["🚫 *Забаненные:*", ""]; MAX_LINES = 30
+    for i, entry in enumerate(banned_list):
+        if i >= MAX_LINES: parts.append("\\.\\.\\. \\(список сокращен\\)"); break
+        uid = entry['user_id']; reason = entry['reason'] or "Н/Д"; t = escape_markdown_v2(time.strftime('%Y-%m-%d %H:%M', time.localtime(entry['banned_at'])))
+        uinfo = await asyncio.to_thread(get_user_info_from_db, uid); name = f"ID: `{uid}`"
+        if uinfo:
+            fname = escape_markdown_v2(uinfo['first_name'] or ""); lname = escape_markdown_v2(uinfo['last_name'] or "")
+            uname = escape_markdown_v2(uinfo['username'] or '?'); name = f"{fname} {lname} (@{uname}) \\(ID: `{uid}`\\)"
+        r = escape_markdown_v2(reason); parts.append(f"\\- {name}"); parts.append(f"  _Причина:_ {r}"); parts.append(f"  _Когда:_ {t}")
+    await msg.reply_text("\n".join(parts), parse_mode='MarkdownV2')
+
+@admin_only
+async def set_default_style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message; user = update.effective_user
+    if not msg or not user: return
+    if not context.args: await msg.reply_text("Укажите стиль: `/set_default_style <стиль>`"); return
+    style = " ".join(context.args).strip()
+    if style:
+        settings.update_default_style(style); await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), bot_activity_percentage)
+        escaped = escape_markdown_v2(style); await msg.reply_text(f"✅ Стиль по умолчанию:\n```\n{escaped}\n```", parse_mode='MarkdownV2'); logger.info(f"Admin {user.id} set global style.")
+    else: await msg.reply_text("Стиль не пустой\\.")
+
+@admin_only
+async def set_bot_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message; user = update.effective_user
+    if not msg or not user: return
+    if not context.args: await msg.reply_text("Укажите имя: `/set_bot_name <имя>`"); return
+    name = " ".join(context.args).strip()
+    if name:
+        settings.update_bot_name(name); await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), bot_activity_percentage)
+        await msg.reply_text(f"✅ Имя бота: *{escape_markdown_v2(settings.BOT_NAME)}*", parse_mode='MarkdownV2'); logger.info(f"Admin {user.id} set bot name to '{settings.BOT_NAME}'.")
+    else: await msg.reply_text("Имя не пустое\\.")
+
+@admin_only
+async def set_activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bot_activity_percentage # Modify global var from state
+    msg = update.message; user = update.effective_user
+    if not msg or not user: return
+    if not context.args: await msg.reply_text(f"Активность: *{bot_activity_percentage}%*\\. Укажите новую: `/set_activity <%>`", parse_mode='MarkdownV2'); return
+    try:
+        percent = int(context.args[0])
+        if 0 <= percent <= 100:
+            bot_activity_percentage = percent; await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), bot_activity_percentage)
+            await msg.reply_text(f"✅ Активность в группах: *{percent}%*", parse_mode='MarkdownV2'); logger.info(f"Admin {user.id} set activity to {percent}%")
+        else: await msg.reply_text("Процент от 0 до 100\\.")
+    except (ValueError, IndexError): await msg.reply_text("Введите число 0\\-100\\.", parse_mode='MarkdownV2')
+
+# --- Команды для управления параметрами генерации Gemini ---
+
+@admin_only
+async def get_gen_params_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущие параметры генерации Gemini."""
+    msg = update.message
+    if not msg: return
+    params = settings.GEMINI_GENERATION_CONFIG
+    params_str = json.dumps(params, indent=2)
+    await msg.reply_text(f"Текущие параметры генерации Gemini:\n```json\n{escape_markdown_v2(params_str)}\n```", parse_mode='MarkdownV2')
+
+@admin_only
+async def set_gen_params_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Устанавливает параметры генерации Gemini (например, /set_gen_params temp=0.6 top_p=0.8)."""
+    msg = update.message; user = update.effective_user
+    if not msg or not user: return
+    if not context.args:
+        await msg.reply_text("Использование: `/set_gen_params <параметр>=<значение> [<параметр2>=<значение2>...]`\nДоступные параметры: `temp`, `top_p`, `top_k`")
+        return
+
+    new_params = settings.GEMINI_GENERATION_CONFIG.copy() # Копируем текущие
+    valid_keys = {"temperature", "top_p", "top_k"} # Допустимые ключи (можно расширить)
+    applied_changes = {}
+    errors = []
+
+    for arg in context.args:
+        if '=' not in arg:
+            errors.append(f"Неверный формат: `{escape_markdown_v2(arg)}`")
+            continue
+        key, value_str = arg.split('=', 1)
+        key = key.strip().lower() # Приводим к нижнему регистру
+
+        # Сопоставляем с допустимыми ключами в конфиге
+        config_key = None
+        if key == 'temp' or key == 'temperature': config_key = 'temperature'
+        elif key == 'top_p': config_key = 'top_p'
+        elif key == 'top_k': config_key = 'top_k'
+        # elif key == 'max_tokens': config_key = 'max_output_tokens' # Если нужно
+
+        if not config_key:
+             errors.append(f"Неизвестный параметр: `{escape_markdown_v2(key)}`")
+             continue
+
+        # Пытаемся преобразовать значение
+        try:
+            if config_key in ['temperature', 'top_p']:
+                value = float(value_str)
+                # Добавляем валидацию диапазона
+                if config_key == 'temperature' and not (0.0 <= value <= 1.0): raise ValueError("Temperature должен быть от 0.0 до 1.0")
+                if config_key == 'top_p' and not (0.0 < value <= 1.0): raise ValueError("Top P должен быть от 0.0 (не вкл.) до 1.0")
+            elif config_key == 'top_k':
+                value = int(value_str)
+                if value <= 0: raise ValueError("Top K должен быть > 0")
+            # elif config_key == 'max_output_tokens':
+            #     value = int(value_str)
+            #     if value <= 0: raise ValueError("Max Tokens должен быть > 0")
+            else: # На случай добавления других типов
+                 errors.append(f"Неподдерживаемый тип параметра: `{escape_markdown_v2(key)}`")
+                 continue
+
+            new_params[config_key] = value
+            applied_changes[config_key] = value
+
+        except ValueError as e:
+            errors.append(f"Неверное значение для `{escape_markdown_v2(key)}`: {escape_markdown_v2(str(e))}")
+
+    if errors:
+        await msg.reply_text("Обнаружены ошибки:\n- " + "\n- ".join(errors), parse_mode='MarkdownV2')
+        return
+
+    if not applied_changes:
+        await msg.reply_text("Не было применено ни одного изменения.")
+        return
+
+    # Обновляем настройки и сохраняем
+    settings.GEMINI_GENERATION_CONFIG = new_params
+    await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), bot_activity_percentage)
+
+    params_str = json.dumps(settings.GEMINI_GENERATION_CONFIG, indent=2)
+    await msg.reply_text(f"✅ Параметры генерации Gemini обновлены:\n```json\n{escape_markdown_v2(params_str)}\n```", parse_mode='MarkdownV2')
+    logger.info(f"Admin {user.id} updated Gemini generation params: {applied_changes}")

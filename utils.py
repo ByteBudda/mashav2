@@ -1,404 +1,352 @@
+# -*- coding: utf-8 -*-
+# utils.py
 import os
 import re
 import time
 import asyncio
 from io import BytesIO
 from functools import lru_cache
-from typing import Dict, Set, Optional, List, Any # Добавили List, Any
+from typing import Optional, List, Dict, Any, Tuple, Deque
 import json
+import pickle
+import sqlite3
+import random
+
+# Убираем Faiss, numpy
 import google.generativeai as genai
 import speech_recognition as sr
 from PIL import Image
 from pydub import AudioSegment
 from telegram import Update
-import random
-from transformers import pipeline
-from telegram.ext import CallbackContext
-# Импорты из проекта
-from config import (logger, GEMINI_API_KEY, DEFAULT_STYLE, BOT_NAME,
-                    CONTEXT_CHECK_PROMPT, ASSISTANT_ROLE, settings, USER_ROLE, SYSTEM_ROLE) # Добавили SYSTEM_ROLE
-# Импортируем нужные части состояния из state.py
-from state import (user_info_db, group_preferences, group_user_style_prompts,
-                   user_preferred_name) # Убрали bot_activity_percentage, т.к. есть get_bot_activity_percentage
-# Импортируем функцию из vector_store
-from vector_store import get_last_bot_message
+from datetime import datetime
+# Импортируем токенизатор
+try:
+    from transformers import AutoTokenizer
+except ImportError:
+    logger.warning("Transformers library not found. Token counting will use simple split(). Install with: pip install transformers")
+    AutoTokenizer = None # type: ignore
 
-# ==============================================================================
-# Начало: Содержимое utils.py
-# ==============================================================================
+# Используем settings и константы из config
+from config import (logger, GEMINI_API_KEY, ASSISTANT_ROLE, settings, TEMP_MEDIA_DIR,
+                    TOKENIZER_MODEL_NAME, CONTEXT_MAX_TOKENS)
+# Импортируем функции доступа к БД и состояние из state
+from state import (
+    chat_history, get_user_info_from_db, update_user_info_in_db,
+    get_user_preferred_name_from_db, set_user_preferred_name_in_db,
+    get_group_user_style_from_db, get_group_style_from_db,
+    get_user_topic_from_db
+)
+# Импортируем типы ролей
+from config import USER_ROLE, ASSISTANT_ROLE, SYSTEM_ROLE
 
-# --- Инициализация AI ---
-# Модель инициализируется здесь, чтобы быть доступной для функций utils
-gemini_model: Optional[genai.GenerativeModel] = None
+# --- Инициализация Gemini ---
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel(settings.GEMINI_MODEL) # Переименовали переменную
+    logger.info(f"Gemini AI model initialized successfully: {settings.GEMINI_MODEL}")
+except Exception as e:
+    logger.critical(f"Failed to configure Gemini AI: {e}", exc_info=True)
+    gemini_model = None
 
-def initialize_gemini_model():
-    global gemini_model
-    if gemini_model:
-        logger.debug("Gemini model already initialized in utils.")
-        return True
-    if not GEMINI_API_KEY:
-        logger.critical("GEMINI_API_KEY not found in environment variables.")
-        return False
+# --- Инициализация Токенизатора ---
+tokenizer = None
+if AutoTokenizer:
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        # Используем модель из настроек
-        gemini_model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
-        logger.info(f"Gemini AI model '{settings.GEMINI_MODEL_NAME}' initialized successfully in utils.")
-        return True
+        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_MODEL_NAME)
+        logger.info(f"Tokenizer '{TOKENIZER_MODEL_NAME}' loaded.")
+        # logger.debug(f"Token test 'привет мир': {tokenizer.encode('привет мир')}")
     except Exception as e:
-        logger.critical(f"Failed to configure Gemini AI in utils: {e}", exc_info=True)
-        gemini_model = None
-        return False
+        logger.error(f"Failed to load tokenizer '{TOKENIZER_MODEL_NAME}': {e}. Using simple split().")
+        tokenizer = None
+else:
+     logger.warning("Transformers library not found. Using simple split() for token counting.")
 
-# Вызов инициализации при загрузке модуля
-initialize_gemini_model()
-
-# --- RuBERT Pipelines ---
-_ner_pipeline = None
-_sentiment_pipeline = None
-
-def get_ner_pipeline():
-    global _ner_pipeline
-    if _ner_pipeline is None:
+def count_tokens(text: str) -> int:
+    """Подсчитывает токены в тексте с помощью загруженного токенизатора или fallback."""
+    if tokenizer:
         try:
-            # Убедитесь, что модель существует и доступна
-            _ner_pipeline = pipeline("ner", model="Data-Lab/rubert-base-cased-conversational_ner-v3", tokenizer="Data-Lab/rubert-base-cased-conversational_ner-v3")
-            logger.info("RuBERT NER pipeline initialized.")
+            # add_special_tokens=False, т.к. считаем токены для частей промпта
+            return len(tokenizer.encode(text, add_special_tokens=False))
         except Exception as e:
-            logger.error(f"Error initializing RuBERT NER pipeline: {e}", exc_info=True)
-            _ner_pipeline = None # Устанавливаем в None при ошибке
-    return _ner_pipeline
+             logger.warning(f"Tokenizer failed for text '{text[:50]}...': {e}. Falling back to word count.")
+             return len(text.split())
+    else: # Fallback
+        return len(text.split())
 
-def get_sentiment_pipeline():
-    global _sentiment_pipeline
-    if _sentiment_pipeline is None:
-        try:
-            # Убедитесь, что модель существует и доступна
-            _sentiment_pipeline = pipeline("sentiment-analysis", model="blanchefort/rubert-base-cased-sentiment")
-            logger.info("RuBERT Sentiment Analysis pipeline initialized.")
-        except Exception as e:
-            logger.error(f"Error initializing RuBERT Sentiment Analysis pipeline: {e}", exc_info=True)
-            _sentiment_pipeline = None # Устанавливаем в None при ошибке
-    return _sentiment_pipeline
 
-# --- Prompt Builder Class ---
+# --- Новая функция сборки контекста ---
+def build_optimized_context(
+    system_message_base: str,
+    topic_context: str,
+    current_message_text: str, # Текст с типом (voice/video)
+    user_name: str,
+    history_deque: Deque[Tuple[str, Optional[str], str, str]],
+    relevant_history: List[Tuple[str, Dict[str, Any]]], # (text, metadata)
+    relevant_facts: List[Tuple[str, Dict[str, Any], float]], # (text, metadata)
+    max_tokens: int = CONTEXT_MAX_TOKENS
+) -> List[str]:
+    """
+    Собирает контекст для LLM, приоритизируя части и соблюдая лимит токенов.
+    Возвращает список строк для финального промпта.
+    """
+    context_parts: List[str] = []
+    current_tokens = 0
+
+    # --- Обязательные части ---
+    # 1. Системный промпт
+    if system_message_base:
+        sys_tokens = count_tokens(system_message_base)
+        if current_tokens + sys_tokens <= max_tokens:
+            context_parts.append(system_message_base); current_tokens += sys_tokens
+        else: logger.warning("System prompt too long!"); context_parts.append(system_message_base[:max_tokens // 2]); return context_parts # Обрезка
+
+    # 2. Тема
+    if topic_context:
+        topic_tokens = count_tokens(topic_context)
+        if current_tokens + topic_tokens <= max_tokens: context_parts.append(topic_context); current_tokens += topic_tokens
+
+    # 3. Текущее сообщение пользователя (проверяем заранее)
+    current_msg_full = f"{USER_ROLE} ({user_name}): {current_message_text}"
+    current_msg_tokens = count_tokens(current_msg_full)
+    if current_tokens + current_msg_tokens > max_tokens:
+        logger.warning("Not enough tokens for current message after system/topic.")
+        # Пытаемся убрать тему, если она есть
+        if topic_context and topic_context in context_parts:
+            context_parts.remove(topic_context); current_tokens -= topic_tokens
+            if current_tokens + current_msg_tokens <= max_tokens: context_parts.append(current_msg_full)
+        # Если не помогло или темы не было, возвращаем то, что есть (только системный промпт)
+        return context_parts
+
+    # Место для истории = max_tokens - current_tokens (уже включает sys+topic) - current_msg_tokens
+    available_tokens_for_history = max_tokens - current_tokens - current_msg_tokens
+    added_history_parts = [] # Собираем историю здесь
+
+    # --- Приоритетные части (Факты -> Недавние -> Релевантные сообщения) ---
+
+    # 4. Релевантные Факты
+    
+    RELEVANCE_THRESHOLD = 0.5  # Define a suitable threshold value
+    highly_relevant_facts_exist = any(dist < RELEVANCE_THRESHOLD for _, _, dist in relevant_facts)
+
+    if available_tokens_for_history > 0 and relevant_facts and highly_relevant_facts_exist:
+        title = "Ключевые факты из памяти:"; title_tokens = count_tokens(title) + 2
+        if available_tokens_for_history >= title_tokens:
+            temp_fact_parts = [title]; temp_fact_tokens = title_tokens; seen_facts = set()
+        # Итерируем по фактам, но добавляем только те, что прошли порог (опционально)
+        # ИЛИ просто добавляем все найденные, раз уж решили показать секцию
+            for fact_text, _, dist in relevant_facts: # Берем расстояние
+            # Можно добавить доп. фильтр: if dist < RELEVANCE_THRESHOLD:
+                cleaned_fact = re.sub(r"^(.*?):\s*", "", fact_text).strip()
+                if cleaned_fact and cleaned_fact not in seen_facts:
+                    line = f"- {cleaned_fact}"; line_tokens = count_tokens(line)
+                    if temp_fact_tokens + line_tokens <= available_tokens_for_history:
+                        temp_fact_parts.append(line); temp_fact_tokens += line_tokens; seen_facts.add(cleaned_fact)
+                    else: break
+            if len(temp_fact_parts) > 1: # Если добавили хотя бы один факт
+             added_history_parts.extend(temp_fact_parts); available_tokens_for_history -= temp_fact_tokens
+
+    # 5. Недавняя история (из deque, новые первыми)
+    if available_tokens_for_history > 0 and history_deque:
+        title = "Недавний диалог (последние сообщения):"; title_tokens = count_tokens(title) + 2
+        if available_tokens_for_history >= title_tokens:
+            temp_recent_parts = []; temp_recent_tokens = title_tokens # Считаем заголовок сразу
+            for role, name, msg, ts_str in reversed(history_deque): # Начиная с самого нового
+                if role != SYSTEM_ROLE:
+                    # Добавляем временную метку в строку
+                    prefix = f"[{ts_str}] {role}"
+                    if role == USER_ROLE and name:
+                        line = f"{prefix} ({name}): {msg}"
+                    else:
+                        line = f"{prefix}: {msg}"
+                    line_tokens = count_tokens(line)
+                    if temp_recent_tokens + line_tokens <= available_tokens_for_history:
+                         temp_recent_parts.append(line); temp_recent_tokens += line_tokens
+                    else: break
+            # Добавляем в правильном порядке (старые выше)
+            if temp_recent_parts:
+                added_history_parts.append(title)
+                added_history_parts.extend(reversed(temp_recent_parts))
+                available_tokens_for_history -= temp_recent_tokens
+
+    # 6. Релевантная история сообщений (из ChromaDB)
+    if available_tokens_for_history > 0 and relevant_history:
+        title = "Релевантные фрагменты из предыдущего общения:"; title_tokens = count_tokens(title) + 2
+        if available_tokens_for_history >= title_tokens:
+            temp_relevant_parts = [title]; temp_relevant_tokens = title_tokens; seen_hist = set()
+            for msg_text, metadata in relevant_history:
+                cleaned_msg = re.sub(r"^(user|assistant|system)\s*\(.*?\):\s*|^(user|assistant|system):\s*", "", msg_text, flags=re.IGNORECASE).strip()
+                if cleaned_msg and cleaned_msg not in seen_hist:
+                    role_prefix = f"{metadata.get('role', '?')}: " if metadata.get('role') else ""
+                    line = f"- {role_prefix}{cleaned_msg}"; line_tokens = count_tokens(line)
+                    if temp_relevant_tokens + line_tokens <= available_tokens_for_history:
+                        temp_relevant_parts.append(line); temp_relevant_tokens += line_tokens; seen_hist.add(cleaned_msg)
+                    else: break
+            if len(temp_relevant_parts) > 1: added_history_parts.extend(temp_relevant_parts); available_tokens_for_history -= temp_relevant_tokens
+
+    # --- Собираем финальный результат ---
+    context_parts.extend(added_history_parts) # Добавляем собранную историю
+    context_parts.append(current_msg_full) # Добавляем текущее сообщение
+
+    final_token_count = max_tokens - available_tokens_for_history
+    logger.debug(f"Optimized context built. Tokens approx: {final_token_count}/{max_tokens}. Parts: {len(context_parts)}")
+    return context_parts
+
+
+# --- PromptBuilder (использует новую функцию) ---
 class PromptBuilder:
-    def __init__(self, bot_name): # Убрали default_style, он приходит в system_message_base
-        self.bot_name = bot_name
-        # self.default_style = default_style # Больше не нужно
+    def __init__(self, bot_settings: settings.__class__):
+        self.settings = bot_settings
 
-    def build_prompt(self, history_str: str, user_profile_info: str, user_name: str, prompt_text: str, system_message_base: str, topic_context: str = "", entities: Optional[List] = None, sentiment: Optional[Dict] = None):
-        """Строит финальный промпт для Gemini, разделяя историю и профиль."""
-        prompt_parts = [system_message_base] # Начинаем с базового стиля/роли
+    def build_prompt(self,
+                     history_deque: Deque[Tuple[str, Optional[str], str]],
+                     relevant_history: List[Tuple[str, Dict[str, Any]]],
+                     relevant_facts: List[Tuple[str, Dict[str, Any]]],
+                     user_name: str,
+                     current_message_text: str, # Текст с типом (voice/video)
+                     system_message_base: str,
+                     topic_context=""):
+        """Строит промпт, используя build_optimized_context."""
+        context_lines = build_optimized_context(
+            system_message_base=system_message_base, topic_context=topic_context,
+            current_message_text=current_message_text, user_name=user_name,
+            history_deque=history_deque, relevant_history=relevant_history,
+            relevant_facts=relevant_facts, max_tokens=CONTEXT_MAX_TOKENS
+        )
+        system_message_base = f"{system_message_base} Ты - {self.settings.BOT_NAME}." # Ваша базовая строка стиля
 
-        # Добавляем статичную информацию о пользователе, если она есть
-        if user_profile_info:
-            prompt_parts.append(f"\n### Информация о пользователе ({user_name})")
-            prompt_parts.append(f"# (Эту информацию не нужно повторять в каждом ответе, используй её для понимания контекста)")
-            prompt_parts.append(f"# {user_profile_info}")
-            prompt_parts.append("### Конец информации о пользователе")
-
-        # Добавляем тему, если есть
-        if topic_context:
-            prompt_parts.append(f"\n{topic_context}") # Тема разговора
-
-        # Добавляем динамическую историю диалога
-        if history_str:
-            prompt_parts.append(f"\n### Недавний диалог (История):")
-            prompt_parts.append(history_str)
-            prompt_parts.append("### Конец диалога")
-        else:
-            prompt_parts.append("\n(Это начало нового диалога)")
-
-        # Добавляем текущее сообщение пользователя
-        prompt_parts.append(f"\n{user_name}: {prompt_text}") # Текущий ввод пользователя
-
-        # Добавляем доп. анализ, если есть
-        if entities:
-            prompt_parts.append(f"\n(Извлеченные сущности: {entities})")
-        if sentiment:
-            prompt_parts.append(f"(Тональность сообщения: {sentiment})")
-
-        # Завершаем промпт ожиданием ответа бота + инструкция
-        prompt_parts.append(f"\n{self.bot_name}:") # Ожидание ответа бота
-        prompt_parts.append("(Важно: Ответь кратко и по делу на последнее сообщение пользователя. НЕ повторяй информацию о пользователе или всю историю диалога без явной необходимости.)")
-
-        final_prompt = "\n".join(prompt_parts)
-        # Ограничиваем длину лога для превью
-        log_preview_length = 500
-        logger.debug(f"Built prompt for Gemini. Length: {len(final_prompt)}. Preview: {final_prompt[:log_preview_length]}{'...' if len(final_prompt) > log_preview_length else ''}")
+        # --- ДОБАВЛЯЕМ ЯВНЫЕ ИНСТРУКЦИИ ---
+        system_message_base += (
+            "\n\nТвоя главная задача - ответить на ПОСЛЕДНЕЕ сообщение пользователя ({USER_ROLE})."
+            "\nИнформация из разделов 'Ключевые факты из памяти' и 'Релевантные фрагменты' дана тебе как КОНТЕКСТ."
+            "\nИСПОЛЬЗУЙ эту информацию для лучшего понимания ситуации, НО НЕ УПОМИНАЙ старые факты или события из прошлого в своем ответе, ЕСЛИ ТОЛЬКО пользователь НЕ СПРАШИВАЕТ о них НАПРЯМУЮ в своем ПОСЛЕДНЕМ сообщении или если это АБСОЛЮТНО НЕОБХОДИМО для ответа на его ПОСЛЕДНИЙ вопрос."
+            "\nСосредоточься на поддержании текущего потока беседы, основываясь на 'Недавнем диалоге' и 'ПОСЛЕДНЕМ сообщении пользователя'."
+            "\nНе начинай ответ с приветствия, если не было приветствия в последнем сообщении пользователя."
+        )
+        context_lines.append(f"\n{self.settings.BOT_NAME}:") # Приглашение к ответу
+        final_prompt = "\n".join(context_lines).strip()
         return final_prompt
 
-# --- Инициализация PromptBuilder (используем имя из настроек) ---
-# Убираем DEFAULT_STYLE из инициализации
-prompt_builder = PromptBuilder(settings.BOT_NAME)
-
-# --- AI и Вспомогательные Функции ---
-
-@lru_cache(maxsize=128) # Кэширование для одинаковых текстовых промптов
+# --- Генерация контента ---
+@lru_cache(maxsize=128)
 def generate_content_sync(prompt: str) -> str:
-    """Синхронная обертка для вызова Gemini API (текст)."""
-    global gemini_model # Используем глобальную модель
-    if not gemini_model:
-        # Попытка повторной инициализации
-        if not initialize_gemini_model():
-             logger.error("Gemini model not initialized. Cannot generate content.")
-             return "[Ошибка: Модель AI не инициализирована]"
-
-    logger.info(f"Sending prompt to Gemini (first 100 chars): {prompt[:100]}...")
+    """Синхронная функция генерации текста с Gemini."""
+    if not gemini_model: return "[Ошибка: Модель Gemini не инициализирована]"
+    logger.info(f"Sending prompt to Gemini ({len(prompt)} chars)...")
     try:
-        # Добавляем safety_settings для уменьшения блокировок (настройте по необходимости)
-        safety_settings_text = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        ]
-        response = gemini_model.generate_content(prompt, safety_settings=safety_settings_text)
+        # Используем настройки из config.settings
+        gen_config = settings.GEMINI_GENERATION_CONFIG
+        safety = getattr(settings, 'GEMINI_SAFETY_SETTINGS', None) # Безопасность пока не настраиваем
+        response = gemini_model.generate_content(prompt, generation_config=gen_config, safety_settings=safety)
 
-        # Улучшенная проверка ответа
-        if hasattr(response, 'text') and response.text:
-            logger.info(f"Received response from Gemini (first 100 chars): {response.text[:100]}...")
-            return response.text
-        elif hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
-             reason = response.prompt_feedback.block_reason
-             logger.warning(f"Gemini response blocked. Reason: {reason}")
-             return f"[Ответ заблокирован: {reason}]"
-        else:
-            # Логируем полный ответ для диагностики, если он не пустой
-            try:
-                full_response_log = f"Gemini response was empty or lacked text. Full response: {response}"
-                logger.warning(full_response_log[:1000]) # Ограничиваем длину лога
-            except Exception as log_e:
-                logger.warning(f"Gemini response was empty or lacked text. Error logging full response: {log_e}")
-            return "[Пустой или некорректный ответ от Gemini]"
-    except Exception as e:
-        logger.error(f"Gemini content generation error: {e}", exc_info=True)
-        return f"[Произошла ошибка при генерации ответа: {type(e).__name__}]"
+        # Обработка ответа
+        if hasattr(response, 'text') and response.text: return response.text
+        # ... (обработка block_reason, finish_reason) ...
+        elif hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason: return f"[Ответ заблокирован: {response.prompt_feedback.block_reason}]"
+        elif response.candidates and response.candidates[0].finish_reason != 'STOP': return f"[Ответ прерван: {response.candidates[0].finish_reason}]"
+        else: logger.warning(f"Gemini empty response: {response}"); return "[Пустой ответ от Gemini]"
+    except Exception as e: logger.error(f"Gemini generation error: {e}", exc_info=True); return f"[Ошибка генерации: {type(e).__name__}]"
 
 async def generate_vision_content_async(contents: list) -> str:
-    """Асинхронная функция для вызова Gemini Vision API."""
-    global gemini_model # Используем глобальную модель
-    if not gemini_model:
-        if not initialize_gemini_model():
-             logger.error("Gemini model not initialized. Cannot generate vision content.")
-             return "[Ошибка: Модель AI не инициализирована]"
-
+    """Асинхронная функция генерации текста по изображению с Gemini."""
+    if not gemini_model: return "[Ошибка: Модель Gemini не инициализирована]"
     logger.info("Sending image/prompt to Gemini Vision...")
     try:
-        safety_settings_vision = [ # Могут отличаться для Vision
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        ]
-        # Вызов generate_content остается синхронным, выполняем в потоке
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: gemini_model.generate_content(contents, safety_settings=safety_settings_vision)
-        )
-        # response = gemini_model.generate_content(contents, safety_settings=safety_settings_vision) # Синхронный вариант
+        gen_config = settings.GEMINI_GENERATION_CONFIG
+        safety = getattr(settings, 'GEMINI_SAFETY_SETTINGS', None)
+        # Используем to_thread для блокирующего вызова
+        response = await asyncio.to_thread(gemini_model.generate_content, contents, generation_config=gen_config, safety_settings=safety)
+        # ... (обработка ответа как в generate_content_sync) ...
+        resp_text = ""
+        if hasattr(response, 'text') and response.text: resp_text = response.text
+        elif response.candidates and hasattr(response.candidates[0],'content') and response.candidates[0].content.parts: resp_text = "".join(p.text for p in response.candidates[0].content.parts if hasattr(p,'text'))
 
-        response_text = response.text if hasattr(response, 'text') else ''
-        if not response_text and hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
-            reason = response.prompt_feedback.block_reason
-            response_text = f"[Ответ на изображение заблокирован: {reason}]"
-            logger.warning(f"Gemini Vision response blocked. Reason: {reason}")
-        elif not response_text:
-             logger.warning("Gemini Vision response was empty.")
-             response_text = "[Не удалось получить описание изображения]"
+        if not resp_text: # Проверка блокировки/ошибки
+            if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason: return f"[Ответ на изображение заблокирован: {response.prompt_feedback.block_reason}]"
+            elif response.candidates and response.candidates[0].finish_reason != 'STOP': return f"[Ответ на изображение прерван: {response.candidates[0].finish_reason}]"
+            else: logger.warning(f"Gemini vision empty response: {response}"); return "[Не удалось получить описание изображения]"
+        return resp_text
+    except Exception as e: logger.error(f"Gemini Vision error: {e}", exc_info=True); return "[Ошибка анализа изображения]"
 
-        logger.info(f"Received vision response (first 100 chars): {response_text[:100]}...")
-        return response_text
-    except Exception as e:
-        logger.error(f"Gemini Vision API error: {e}", exc_info=True)
-        return "[Ошибка при анализе изображения]"
-
+# --- Фильтрация ответа (без изменений) ---
 def filter_response(response: str) -> str:
-    """Очищает ответ от потенциальных артефактов."""
-    if not response or response.startswith("["): # Не трогаем сообщения об ошибках/блокировках
-        return response
+    if not response: return ""
+    filtered = re.sub(r"^(assistant:|system:|user:|model:)\s*", "", response, flags=re.IGNORECASE | re.MULTILINE).strip()
+    filtered = re.sub(r"```[\w\W]*?```", "", filtered) # Убираем блоки кода
+    filtered = re.sub(r"`[^`]+`", "", filtered) # Убираем инлайн-код
+    filtered = re.sub(r"^\*+(.*?)\*+$", r"\1", filtered).strip() # Убираем * в начале/конце
+    if filtered.startswith('{') and filtered.endswith('}'): # Пытаемся убрать JSON
+        try: data=json.loads(filtered); f=data.get('response', data.get('text')); filtered=f if isinstance(f,str) else ""
+        except: pass
+    return "\n".join(line.strip() for line in filtered.splitlines() if line.strip())
 
-    # Убираем стандартные префиксы ролей (регистронезависимо)
-    # Добавляем BOT_NAME для удаления самоцитирования
-    prefixes_to_remove = [f"{role.lower()}:" for role in [USER_ROLE, ASSISTANT_ROLE, SYSTEM_ROLE, BOT_NAME]]
-    filtered = response.strip()
-    # Повторяем удаление, пока префиксы находятся
-    while True:
-        original_length = len(filtered)
-        for prefix in prefixes_to_remove:
-            if filtered.lower().startswith(prefix):
-                filtered = filtered[len(prefix):].strip()
-        if len(filtered) == original_length: # Если длина не изменилась, префиксов больше нет
-            break
-
-    # Дополнительная очистка от возможных артефактов (если нужно)
-    # filtered = re.sub(r"```[\w\W]*?```", "", filtered) # Удаление блоков кода
-    # filtered = re.sub(r"`[^`]+`", "", filtered) # Удаление inline кода
-
-    # Удаление лишних пробелов и пустых строк
-    filtered = "\n".join(line.strip() for line in filtered.splitlines() if line.strip())
-
-    return filtered.strip()
-
+# --- Распознавание речи (без изменений) ---
 async def transcribe_voice(file_path: str) -> Optional[str]:
-    """Распознает речь из аудиофайла (WAV)."""
-    logger.info(f"Attempting to transcribe audio file: {file_path}")
-    recognizer = sr.Recognizer()
+    # ... (код как раньше) ...
+    logger.info(f"Transcribing: {file_path}")
+    r = sr.Recognizer(); text = None
     try:
-        with sr.AudioFile(file_path) as source:
-            audio_data = recognizer.record(source)
-            logger.info(f"Audio data recorded from file {file_path}.")
-            try:
-                # Запускаем распознавание в отдельном потоке
-                loop = asyncio.get_running_loop()
-                text = await loop.run_in_executor(
-                    None, # Стандартный ThreadPoolExecutor
-                    lambda: recognizer.recognize_google(audio_data, language="ru-RU")
-                )
-                # text = recognizer.recognize_google(audio_data, language="ru-RU") # Синхронный вариант
-                logger.info(f"Transcription successful for {file_path}: {text}")
-                return text
-            except sr.UnknownValueError:
-                logger.warning(f"Google Speech Recognition could not understand audio from {file_path}.")
-                return "[Не удалось распознать речь]"
-            except sr.RequestError as e:
-                logger.error(f"Could not request results from Google SR service for {file_path}: {e}")
-                return f"[Ошибка сервиса распознавания: {e}]"
-    except FileNotFoundError:
-         logger.error(f"Audio file not found for transcription: {file_path}")
-         return "[Ошибка: Файл не найден]"
-    except Exception as e:
-        logger.error(f"Error processing audio file {file_path}: {e}", exc_info=True)
-        return "[Ошибка обработки аудио]"
-    # finally блок не нужен, т.к. удаление файла происходит в вызывающем коде
+        with sr.AudioFile(file_path) as source: audio = r.record(source)
+        text = await asyncio.to_thread(r.recognize_google, audio, language="ru-RU")
+        logger.info(f"Transcription OK: {text}")
+    except sr.UnknownValueError: logger.warning("Audio not understood."); text="[Не удалось распознать речь]"
+    except sr.RequestError as e: logger.error(f"Google API error: {e}"); text=f"[Ошибка сервиса: {e}]"
+    except FileNotFoundError: logger.error(f"File not found: {file_path}"); text="[Ошибка: Файл не найден]"
+    except Exception as e: logger.error(f"Audio processing error: {e}"); text="[Ошибка обработки аудио]"
+    finally:
+        if os.path.exists(file_path): 
+            try: 
+                os.remove(file_path) 
+            except Exception: 
+                pass
+    return text
 
+
+# --- Определение эффективного стиля (без изменений) ---
 async def _get_effective_style(chat_id: int, user_id: int, user_name: Optional[str], chat_type: str) -> str:
-    """Определяет эффективный стиль общения, учитывая настройки группы и пользователя."""
-    # Используем переменные состояния, импортированные из state.py
+    # ... (код как раньше) ...
+    style = None
     if chat_type in ['group', 'supergroup']:
-        # 1. Стиль, заданный админом для конкретного пользователя в этой группе
-        user_group_style = group_user_style_prompts.get((chat_id, user_id))
-        if user_group_style:
-            logger.debug(f"Using specific group user style for {user_id} in {chat_id}.")
-            return user_group_style
-        # 2. Общий стиль для группы (если задан)
-        group_style = group_preferences.get(chat_id, {}).get("style")
-        if group_style:
-            logger.debug(f"Using group style for chat {chat_id}.")
-            return group_style
+        style = await asyncio.to_thread(get_group_user_style_from_db, chat_id, user_id)
+        if style: return style
+        style = await asyncio.to_thread(get_group_style_from_db, chat_id)
+        if style: return style
+    return settings.DEFAULT_STYLE
 
-    # 3. Персональный стиль пользователя (если не в группе или групповые не заданы)
-    # Стили из user_info_db пока не реализованы, используем только имя
-    # user_personal_style = user_info_db.get(user_id, {}).get("preferences", {}).get("style")
-    # if user_personal_style: return user_personal_style
-
-    # 4. Стиль по умолчанию
-    logger.debug(f"Using default style for user {user_id} in chat {chat_id}.")
-    return settings.DEFAULT_STYLE # Из config.py
-
-async def is_context_related(current_message: str, user_id: int, chat_id: int, chat_type: str) -> bool:
-    """Проверяет, связано ли сообщение пользователя с последним ответом бота, используя ChromaDB."""
-    history_key = chat_id if chat_type in ['group', 'supergroup'] else user_id
-
-    last_bot_message = await get_last_bot_message(history_key)
-
-    if not last_bot_message:
-        logger.debug(f"No previous bot message found in vector store for key {history_key}. Assuming not related.")
-        return False
-    if len(current_message.split()) < 2 and current_message.lower() not in ['да', 'нет', 'ага', 'угу', 'спасибо', 'спс', 'ок']:
-        logger.debug(f"Message '{current_message}' too short for context check.")
-        return False # Слишком короткое сообщение, вероятно не контекстное (кроме простых ответов)
-
-    prompt = CONTEXT_CHECK_PROMPT.format(current_message=current_message, last_bot_message=last_bot_message)
-    logger.debug(f"Checking context for user {user_id} in chat {chat_id} (vector store)")
-    try:
-        # Используем generate_content_sync в отдельном потоке
-        response_text = await asyncio.to_thread(generate_content_sync, prompt)
-        logger.debug(f"Context check response: {response_text}")
-        is_related = response_text.strip().lower().startswith("да")
-        logger.info(f"Context check result for user {user_id} (vector store): {is_related}")
-        return is_related
-    except Exception as e:
-        logger.error(f"Error during context check (vector store): {e}", exc_info=True)
-        return False
-
+# --- Обновление информации о пользователе (без изменений) ---
 async def update_user_info(update: Update):
-    """Обновляет информацию о пользователе в user_info_db."""
+    # ... (код как раньше) ...
     if not update.effective_user: return
+    user=update.effective_user; uid=user.id
+    await asyncio.to_thread(update_user_info_in_db, uid, user.username, user.first_name, user.last_name, user.language_code, user.is_bot)
+    async def set_name():
+        if not await asyncio.to_thread(get_user_preferred_name_from_db, uid):
+            name = user.first_name or f"User_{uid}"; await asyncio.to_thread(set_user_preferred_name_in_db, uid, name); logger.info(f"Set default name '{name}' for {uid}")
+    asyncio.create_task(set_name())
 
-    user = update.effective_user
-    user_id = user.id
-    current_time = time.time()
 
-    # Инициализируем запись, если пользователя нет
-    if user_id not in user_info_db:
-        user_info_db[user_id] = {"preferences": {}, "first_seen": current_time}
-        # Устанавливаем имя по умолчанию при первом появлении
-        user_preferred_name[user_id] = user.first_name
-        logger.info(f"New user detected: {user.first_name} ({user_id}).")
-
-    # Обновляем данные
-    user_info_db[user_id]["username"] = user.username
-    user_info_db[user_id]["first_name"] = user.first_name
-    user_info_db[user_id]["last_name"] = user.last_name
-    user_info_db[user_id]["is_bot"] = user.is_bot
-    user_info_db[user_id]["language_code"] = user.language_code
-    user_info_db[user_id]["last_seen"] = current_time
-
-    # Убеждаемся, что имя есть в user_preferred_name
-    if user_id not in user_preferred_name:
-         user_preferred_name[user_id] = user.first_name
-
-    logger.debug(f"User info updated for user_id: {user_id}")
-
-async def cleanup_audio_files_job(context: CallbackContext): # context нужен для JobQueue
-    """Периодическая задача для удаления временных аудио/видео файлов."""
-    bot_folder = "." # Текущая директория
-    deleted_count = 0
-    logger.debug("Starting temporary audio/video file cleanup...")
+# --- Очистка временных медиа файлов (без изменений) ---
+async def cleanup_audio_files_job(context):
+    # ... (код как раньше) ...
+    cnt=0; tdir=TEMP_MEDIA_DIR; age=3600*3; logger.debug(f"Cleanup media in '{tdir}' (> {age}s)...")
+    try: os.makedirs(tdir, exist_ok=True)
+    except OSError as e: logger.error(f"Access error '{tdir}': {e}"); return
+    now=time.time()
     try:
-        current_time = time.time()
-        # Ищем файлы старше 1 часа (3600 секунд)
-        cleanup_older_than = 3600
-        for filename in os.listdir(bot_folder):
-            # Ищем файлы, созданные нашими хендлерами
-            if filename.startswith(("voice_", "video_note_")) and filename.lower().endswith((".wav", ".oga", ".mp4")):
-                file_path = os.path.join(bot_folder, filename)
+        for fn in os.listdir(tdir):
+            if (fn.startswith(("voice_", "vnote_")) and fn.lower().endswith((".wav",".oga",".mp4"))):
+                fp=os.path.join(tdir, fn)
                 try:
-                    file_mod_time = os.path.getmtime(file_path)
-                    if current_time - file_mod_time > cleanup_older_than:
-                        os.remove(file_path)
-                        logger.info(f"Deleted old temporary audio/video file: {file_path}")
-                        deleted_count += 1
-                    else:
-                         logger.debug(f"Skipping relatively new temporary file: {file_path}")
-                except FileNotFoundError:
-                     logger.warning(f"Temporary file {file_path} not found during cleanup (possibly already deleted).")
-                except Exception as e:
-                    logger.error(f"Error processing/deleting file {file_path}: {e}")
-        if deleted_count > 0:
-            logger.info(f"Temporary audio/video file cleanup finished. Deleted {deleted_count} old files.")
-        else:
-            logger.debug("Temporary audio/video file cleanup: No old files found to delete.")
-    except Exception as e:
-        logger.error(f"Error during temporary audio/video file cleanup scan: {e}", exc_info=True)
+                    if now - os.path.getmtime(fp) > age: os.remove(fp); logger.info(f"Deleted old: {fp}"); cnt+=1
+                except FileNotFoundError: continue
+                except Exception as e: logger.error(f"Error deleting {fp}: {e}")
+        if cnt > 0: logger.info(f"Media cleanup done. Deleted {cnt} files.")
+        else: logger.debug("Media cleanup: No old files.")
+    except Exception as e: logger.error(f"Media cleanup scan error: {e}")
 
-def should_process_message(activity_percentage: int) -> bool:
-    """Определяет, следует ли обрабатывать сообщение на основе процента активности."""
-    if activity_percentage >= 100:
-        return True
-    if activity_percentage <= 0:
-        return False
-    return random.randint(1, 100) <= activity_percentage
 
-def get_bot_activity_percentage() -> int:
-    """Возвращает текущий процент активности бота."""
-    # импортируем здесь, чтобы избежать циклического импорта, если utils импортируется из state
+# --- Проверка активности бота (без изменений) ---
+def should_process_message() -> bool:
     from state import bot_activity_percentage
-    return bot_activity_percentage
-
-# ==============================================================================
-# Конец: Содержимое utils.py
-# ==============================================================================
+    if bot_activity_percentage >= 100: return True
+    if bot_activity_percentage <= 0: return False
+    return random.randint(1, 100) <= bot_activity_percentage
