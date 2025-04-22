@@ -1,24 +1,10 @@
-# Telegram Bot Framework
-python-telegram-bot
-
-# LLM APIs
-google-generativeai
-mistralai
-
-# Vector Database & Embeddings
-chromadb              # Клиент ChromaDB.
-sentence-transformers # Для эмбеддингов
-transformers          # Для токенизатора и sentence-transformers.
-torch                 # Бэкенд для sentence-transformers/transformers.
-sentencepiece         # Часто требуется для токенизаторов.
-
-# Audio Processing
-# ВНИМАНИЕ: pydub НЕ БУДЕТ работать  без установки ffmpeg!
-pydub
-SpeechRecognition     # Для транскрипции (использует внешние API).
-
-# Image Processing
-Pillow
-
-# Environment Variables Helper (полезно для локальной разработки)
-python-dotenv
+python-telegram-bot==20.3
+python-dotenv==1.0.0
+PyPDF2==3.0.1
+python-docx==0.8.11
+Pillow==10.0.0
+pydub==0.25.1
+transformers==4.34.0
+mistralai==1.2.0
+chromadb==0.4.5
+sqlite-utils==3.36.0
