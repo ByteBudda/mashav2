@@ -11,8 +11,6 @@ import json
 import pickle
 import sqlite3
 import random
-
-# Убираем Faiss, numpy
 import google.generativeai as genai
 import speech_recognition as sr
 from PIL import Image
@@ -27,7 +25,7 @@ except ImportError:
     AutoTokenizer = None # type: ignore
 
 # Используем settings и константы из config
-from config import (BotSettings, logger, GEMINI_API_KEY, ASSISTANT_ROLE, settings, TEMP_MEDIA_DIR,
+from config import (logger, BotSettings, logger, GEMINI_API_KEY, ASSISTANT_ROLE, settings, TEMP_MEDIA_DIR,
                     TOKENIZER_MODEL_NAME, CONTEXT_MAX_TOKENS)
 # Импортируем функции доступа к БД и состояние из state
 from state import (

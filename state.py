@@ -206,7 +206,7 @@ def save_bot_settings_to_db(current_settings: Dict[str, Any], activity: int):
 
 def load_active_histories_from_db():
     """Загружает недавние истории чатов в память (deque)."""
-    global chat_history, last_activity; chat_history.clear(); last_activity.clear()
+    chat_history.clear(); last_activity.clear()
     cutoff_time = time.time() - settings.HISTORY_TTL
     active_keys_rows = _execute_db("SELECT history_key, MAX(timestamp) as last_ts FROM history WHERE timestamp > ? GROUP BY history_key", (cutoff_time,), fetch_all=True)
     if active_keys_rows is None: logger.error("Could not load active history keys."); return
@@ -495,7 +495,6 @@ async def fact_extraction_job(context: CallbackContext):
 # --- Функции управления состоянием ---
 def add_to_memory_history(key: int, role: str, message: str, user_name: Optional[str] = None):
     """Добавляет сообщение в историю чата (только в памяти) и обновляет время активности."""
-    global chat_history, last_activity
     if key not in chat_history: chat_history[key] = deque(maxlen=settings.MAX_HISTORY)
     now = time.time()
     ts_str = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S")
@@ -506,7 +505,7 @@ def add_to_memory_history(key: int, role: str, message: str, user_name: Optional
 
 async def cleanup_history_job(context):
     """Периодическая задача для удаления старой истории и ФАКТОВ."""
-    global chat_history, last_activity; current_time = time.time()
+    current_time = time.time()
     keys_to_delete_mem = [k for k, ts in last_activity.items() if current_time - ts > settings.HISTORY_TTL]
     deleted_mem_cnt = 0
     for key in keys_to_delete_mem:
