@@ -112,7 +112,7 @@ async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_
         if update.message.text: prompt_text = update.message.text; message_type = "text"
         elif update.message.voice:
              message_type = "voice"; voice = update.message.voice
-             await context.bot.send_chat_action(chat_id, constants.ChatAction.RECORD_AUDIO); vf = await voice.get_file()
+             await context.bot.send_chat_action(chat_id, constants.ChatAction.RECORD_VOICE); vf = await voice.get_file()
              base = f"voice_{user_id}_{int(time.time())}"; p_oga = os.path.join(TEMP_MEDIA_DIR, f"{base}.oga"); p_wav = os.path.join(TEMP_MEDIA_DIR, f"{base}.wav")
              temp_file_paths.extend([p_oga, p_wav]); await vf.download_to_drive(p_oga); logger.debug(f"Voice downloaded: {p_oga}")
              try: AudioSegment.from_file(p_oga).export(p_wav, format="wav"); logger.debug(f"Converted to {p_wav}")
