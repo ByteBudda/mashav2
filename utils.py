@@ -17,6 +17,9 @@ from PIL import Image
 from pydub import AudioSegment
 from telegram import Update
 from datetime import datetime
+# Используем settings и константы из config
+from config import (logger, BotSettings, logger, GEMINI_API_KEY, ASSISTANT_ROLE, settings, TEMP_MEDIA_DIR,
+                    TOKENIZER_MODEL_NAME, CONTEXT_MAX_TOKENS)
 # Импортируем токенизатор
 try:
     from transformers import AutoTokenizer
@@ -24,9 +27,7 @@ except ImportError:
     logger.warning("Transformers library not found. Token counting will use simple split(). Install with: pip install transformers")
     AutoTokenizer = None # type: ignore
 
-# Используем settings и константы из config
-from config import (logger, BotSettings, logger, GEMINI_API_KEY, ASSISTANT_ROLE, settings, TEMP_MEDIA_DIR,
-                    TOKENIZER_MODEL_NAME, CONTEXT_MAX_TOKENS)
+
 # Импортируем функции доступа к БД и состояние из state
 from state import (
     chat_history, get_user_info_from_db, update_user_info_in_db,
