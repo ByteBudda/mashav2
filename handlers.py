@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # handlers.py
 import asyncio
 import os
@@ -12,6 +11,9 @@ from telegram import Update, constants
 from telegram.ext import ContextTypes
 import pydub
 from pydub import AudioSegment
+
+# Импорт нового модуля
+from documents_handler import read_pdf, read_docx, read_txt, read_py, generate_document
 
 # Используем settings и константы из config
 from config import (ASSISTANT_ROLE, SYSTEM_ROLE, USER_ROLE,
@@ -89,7 +91,6 @@ async def _process_generation_and_reply(
         try: await context.bot.send_message(chat_id=chat_id, text=reply_text, reply_to_message_id=reply_to_message_id)
         except Exception as e: logger.error(f"Failed to send empty response message to {chat_id}: {e}")
 
-
 # --- Объединенный обработчик для текста, голоса, видео ---
 async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user; chat = update.effective_chat
@@ -107,8 +108,6 @@ async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_
     except OSError as e: logger.error(f"Failed to create '{TEMP_MEDIA_DIR}': {e}"); await update.message.reply_text("Ошибка папки медиа."); return
 
     try: # Обработка типов сообщений
-        # ... (Код обработки text, voice, video_note как в предыдущем ответе, с транскрипцией и т.д.) ...
-        # Важно: prompt_text должен содержать распознанный текст БЕЗ меток (voice/video)
         if update.message.text: prompt_text = update.message.text; message_type = "text"
         elif update.message.voice:
              message_type = "voice"; voice = update.message.voice
@@ -128,6 +127,24 @@ async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_
              except Exception as e: logger.error(f"Video note audio error: {e}"); await update.message.reply_text("Ошибка обработки видео."); return
              prompt_text = await transcribe_voice(p_wav)
              if not prompt_text or prompt_text.startswith("["): logger.warning(f"Transcription failed: {prompt_text}"); await update.message.reply_text(f"Распознавание видео: {prompt_text or 'ошибка'}"); return
+        elif update.message.document:
+             message_type = "document"; document = update.message.document
+             await context.bot.send_chat_action(chat_id, constants.ChatAction.TYPING); df = await document.get_file()
+             file_path = os.path.join(TEMP_MEDIA_DIR, document.file_name)
+             temp_file_paths.append(file_path); await df.download_to_drive(file_path); logger.debug(f"Document downloaded: {file_path}")
+             file_extension = os.path.splitext(file_path)[1].lower()
+             if file_extension == '.pdf':
+                 prompt_text = read_pdf(file_path)
+             elif file_extension == '.docx':
+                 prompt_text = read_docx(file_path)
+             elif file_extension in ['.txt', '.py']:
+                 prompt_text = read_txt(file_path)
+             else:
+                 await update.message.reply_text("Неподдерживаемый формат документа.")
+                 return
+             if not prompt_text:
+                 await update.message.reply_text("Ошибка чтения документа.")
+                 return
     except Exception as e: logger.error(f"Error processing {message_type}: {e}"); await update.message.reply_text(f"Ошибка обработки {message_type}."); return
     finally: # Очистка временных файлов
         for fp in temp_file_paths:
@@ -160,6 +177,7 @@ async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_
     prompt_input_text = prompt_text
     if message_type == "voice": prompt_input_text += " (голосовое сообщение)"
     elif message_type == "video_note": prompt_input_text += " (видеосообщение)"
+    elif message_type == "document": prompt_input_text += " (документ)"
     # ------------------------------------------------
 
     # --- Ответ ---
@@ -211,7 +229,6 @@ async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_
 
     # --- Запуск извлечения фактов (опционально, можно вынести в Job) ---
     # asyncio.create_task(extract_and_save_facts(history_key))
-
 
 # --- Обработчик фото ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -287,7 +304,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error handling photo for {user_id} in {chat_id}: {e}", exc_info=True)
         try: await update.message.reply_text("Ошибка при обработке фото.")
         except Exception as send_e: logger.error(f"Failed sending photo error msg to {chat_id}: {send_e}")
-
 
 # --- Переназначение обработчиков ---
 handle_message = handle_text_voice_video

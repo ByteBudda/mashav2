@@ -44,7 +44,8 @@ def setup_handlers(application: Application):
         application.add_handler(CommandHandler(command, handler))
 
     # Обработчики сообщений
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND | filters.VOICE | filters.VIDEO_NOTE, handle_message))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND | filters.VOICE | filters.VIDEO_NOTE | filters.Document.ALL,
+    handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     # Обработчик колбэков
