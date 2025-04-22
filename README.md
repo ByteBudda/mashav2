@@ -34,7 +34,7 @@
 1. Клонируйте репозиторий:
    ```bash
    git clone https://github.com/ByteBudda/mashav2.git
-   cd chatbot
+   cd mashav2
    ```
 
 2. Установите зависимости:
