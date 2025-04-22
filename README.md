@@ -33,7 +33,7 @@
 
 1. Клонируйте репозиторий:
    ```bash
-   git clone https://github.com/your-username/chatbot.git
+   git clone https://github.com/ByteBudda/mashav2.git
    cd chatbot
    ```
 
