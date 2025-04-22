@@ -27,7 +27,7 @@ except ImportError:
     AutoTokenizer = None # type: ignore
 
 # Используем settings и константы из config
-from config import (logger, GEMINI_API_KEY, ASSISTANT_ROLE, settings, TEMP_MEDIA_DIR,
+from config import (BotSettings, logger, GEMINI_API_KEY, ASSISTANT_ROLE, settings, TEMP_MEDIA_DIR,
                     TOKENIZER_MODEL_NAME, CONTEXT_MAX_TOKENS)
 # Импортируем функции доступа к БД и состояние из state
 from state import (
@@ -194,7 +194,7 @@ def build_optimized_context(
 
 # --- PromptBuilder (использует новую функцию) ---
 class PromptBuilder:
-    def __init__(self, bot_settings: settings.__class__):
+    def __init__(self, bot_settings: BotSettings.__class__):
         self.settings = bot_settings
 
     def build_prompt(self,

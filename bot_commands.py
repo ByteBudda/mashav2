@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # bot_commands.py
 import asyncio
+import json
 import re # Импортируем re для экранирования
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile, constants
 from telegram.ext import ContextTypes, CallbackContext, CommandHandler, CallbackQueryHandler, filters

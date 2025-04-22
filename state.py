@@ -14,8 +14,8 @@ from datetime import datetime
 # --- Импорт клиента Mistral ---
 # Используем try-except на случай, если библиотека не установлена
 try:
-    from mistralai.client import MistralClient
-    from mistralai.models.chat_completion import ChatMessage
+    from mistralai import MistralClient
+    from mistralai import ChatMessage
     MISTRAL_AVAILABLE = True
 except ImportError:
     MistralClient = None # type: ignore
