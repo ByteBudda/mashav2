@@ -3,6 +3,11 @@ import os
 from PyPDF2 import PdfReader
 from docx import Document as DocxDocument
 import io
+import logging
+
+# Configure logger
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def read_pdf(file_path):
     """Чтение текста из PDF файла."""
