@@ -155,7 +155,7 @@
 
 - [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot)
 - [ChromaDB](https://www.trychroma.com/)
-- [Gemini AI](https://gemini.ai/)
+- [Gemini AI](https://aistudio.google.com/)
 - [Mistral AI](https://mistral.ai/)
 - [Sentence Transformers](https://www.sbert.net/)
 ---
