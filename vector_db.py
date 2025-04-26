@@ -54,6 +54,7 @@ def initialize_vector_db():
 # --- Управление коллекциями ---
 async def get_or_create_collection(name: str) -> Optional[chromadb.Collection]:
     """Асинхронно и потокобезопасно получает или создает коллекцию ChromaDB."""
+    global client, collection_cache, cache_lock
     if not client: logger.error("ChromaDB client not initialized."); return None
 
     # Сначала проверяем кэш асинхронно
@@ -80,6 +81,7 @@ async def get_or_create_collection(name: str) -> Optional[chromadb.Collection]:
 # Синхронная версия для инициализации коллекции фактов
 def get_or_create_facts_collection_sync() -> Optional[chromadb.Collection]:
     """Синхронно получает или создает единую коллекцию для фактов."""
+    global client
     if not client: return None
     name = CHROMA_FACTS_COLLECTION_NAME
     try:
@@ -110,6 +112,7 @@ async def get_history_collection(history_key: int) -> Optional[chromadb.Collecti
 
 def add_message_embedding_sync(sqlite_id: int, history_key: int, role: str, text: str):
     """Синхронная функция добавления эмбеддинга сообщения (для to_thread)."""
+    global model
     if model is None: return
     if not text or not text.strip(): return
 
@@ -136,6 +139,7 @@ def add_message_embedding_sync(sqlite_id: int, history_key: int, role: str, text
 
 def add_fact_embedding_sync(fact_id: str, history_key: int, fact_type: str, fact_text: str):
     """Синхронная функция добавления эмбеддинга факта (для to_thread)."""
+    global model
     if model is None: return
     if not fact_text or not fact_text.strip(): return
 
@@ -157,6 +161,7 @@ def add_fact_embedding_sync(fact_id: str, history_key: int, fact_type: str, fact
 
 def search_relevant_history_sync(history_key: int, query_text: str, k: int = VECTOR_SEARCH_K_HISTORY) -> List[Tuple[str, Dict[str, Any]]]:
     """Синхронная функция поиска релевантной истории (для to_thread)."""
+    global model
     results = []
     if model is None: return results
     if not query_text or not query_text.strip(): return results
@@ -190,6 +195,7 @@ def search_relevant_history_sync(history_key: int, query_text: str, k: int = VEC
 
 def search_relevant_facts_sync(history_key: int, query_text: str, k: int = VECTOR_SEARCH_K_FACTS) -> List[Tuple[str, Dict[str, Any]]]:
     """Синхронная функция поиска релевантных фактов (для to_thread)."""
+    global model
     results = []
     if model is None: return results
     if not query_text or not query_text.strip(): return results

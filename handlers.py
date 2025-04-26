@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # handlers.py
 import asyncio
 import os
@@ -12,10 +13,8 @@ from telegram.ext import ContextTypes
 import pydub
 from pydub import AudioSegment
 
-# Импорт нового модуля
-from documents_handler import read_pdf, read_docx, read_txt, read_py, generate_document
-
 # Используем settings и константы из config
+from bot_commands import escape_markdown_v2
 from config import (ASSISTANT_ROLE, SYSTEM_ROLE, USER_ROLE,
                     logger, settings, TEMP_MEDIA_DIR)
 # Импортируем функции работы с состоянием/БД
@@ -91,6 +90,9 @@ async def _process_generation_and_reply(
         try: await context.bot.send_message(chat_id=chat_id, text=reply_text, reply_to_message_id=reply_to_message_id)
         except Exception as e: logger.error(f"Failed to send empty response message to {chat_id}: {e}")
 
+
+
+    
 # --- Объединенный обработчик для текста, голоса, видео ---
 async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user; chat = update.effective_chat
@@ -106,8 +108,31 @@ async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_
 
     try: os.makedirs(TEMP_MEDIA_DIR, exist_ok=True)
     except OSError as e: logger.error(f"Failed to create '{TEMP_MEDIA_DIR}': {e}"); await update.message.reply_text("Ошибка папки медиа."); return
+    # --- ПРОВЕРКА НА КОНКРЕТНЫЙ ВОПРОС ---
+    if prompt_text:
+        normalized_text = prompt_text.lower().strip().replace('?', '').replace('.', '').replace('!', '')
+    else:
+        normalized_text = ""
+    creator_questions = [
+        "кто тебя создал",
+        "кто твой создатель",
+        "кто тебя сделал",
+        "кто твой разработчик",
+        "кто тебя написал"
+    ]
 
+    if normalized_text in creator_questions:
+        logger.info(f"User {user_id} asked about the creator. Replying directly.")
+        # Экранируем имя пользователя Telegram для MarkdownV2
+        creator_username = escape_markdown_v2("@ByteBudda")
+        reply_text = f"Меня создал замечательный человек Александр {creator_username} 😊"
+        await update.message.reply_text(reply_text, parse_mode='MarkdownV2')
+        # Завершаем обработку здесь, не идем дальше к LLM
+        return
+    # ------------------------------------
     try: # Обработка типов сообщений
+        # ... (Код обработки text, voice, video_note как в предыдущем ответе, с транскрипцией и т.д.) ...
+        # Важно: prompt_text должен содержать распознанный текст БЕЗ меток (voice/video)
         if update.message.text: prompt_text = update.message.text; message_type = "text"
         elif update.message.voice:
              message_type = "voice"; voice = update.message.voice
@@ -127,24 +152,6 @@ async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_
              except Exception as e: logger.error(f"Video note audio error: {e}"); await update.message.reply_text("Ошибка обработки видео."); return
              prompt_text = await transcribe_voice(p_wav)
              if not prompt_text or prompt_text.startswith("["): logger.warning(f"Transcription failed: {prompt_text}"); await update.message.reply_text(f"Распознавание видео: {prompt_text or 'ошибка'}"); return
-        elif update.message.document:
-             message_type = "document"; document = update.message.document
-             await context.bot.send_chat_action(chat_id, constants.ChatAction.TYPING); df = await document.get_file()
-             file_path = os.path.join(TEMP_MEDIA_DIR, document.file_name)
-             temp_file_paths.append(file_path); await df.download_to_drive(file_path); logger.debug(f"Document downloaded: {file_path}")
-             file_extension = os.path.splitext(file_path)[1].lower()
-             if file_extension == '.pdf':
-                 prompt_text = read_pdf(file_path)
-             elif file_extension == '.docx':
-                 prompt_text = read_docx(file_path)
-             elif file_extension in ['.txt', '.py']:
-                 prompt_text = read_txt(file_path)
-             else:
-                 await update.message.reply_text("Неподдерживаемый формат документа.")
-                 return
-             if not prompt_text:
-                 await update.message.reply_text("Ошибка чтения документа.")
-                 return
     except Exception as e: logger.error(f"Error processing {message_type}: {e}"); await update.message.reply_text(f"Ошибка обработки {message_type}."); return
     finally: # Очистка временных файлов
         for fp in temp_file_paths:
@@ -177,7 +184,6 @@ async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_
     prompt_input_text = prompt_text
     if message_type == "voice": prompt_input_text += " (голосовое сообщение)"
     elif message_type == "video_note": prompt_input_text += " (видеосообщение)"
-    elif message_type == "document": prompt_input_text += " (документ)"
     # ------------------------------------------------
 
     # --- Ответ ---
@@ -199,18 +205,40 @@ async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_
 
     else: # Группа
         should_reply = False
-        if should_process_message():
-            try: bot_info = await context.bot.get_me(); bot_id = bot_info.id; bot_uname = bot_info.username
-            except Exception as e: logger.error(f"Failed getting bot info: {e}"); bot_id = None; bot_uname = settings.BOT_NAME
-            mentioned = (bot_uname and f"@{bot_uname}".lower() in prompt_input_text.lower()) or \
-                        settings.BOT_NAME.lower() in prompt_input_text.lower()
-            replied = update.message.reply_to_message and update.message.reply_to_message.from_user and update.message.reply_to_message.from_user.id == bot_id
-            if mentioned or replied: should_reply = True; logger.info(f"Processing group {message_type} from {user_name} ({user_id}). Reason: M={mentioned}, R={replied}")
-            else: logger.info(f"Ignoring group {message_type} from {user_name} ({user_id}) (no mention/reply).")
-        else: logger.debug(f"Skipping group msg from {user_id} due to activity ({bot_activity_percentage}%).")
+        # Проверяем активность один раз
+        activity_check_passed = should_process_message()
+
+        if activity_check_passed:
+            # Если активность 100%, отвечаем всегда
+            if bot_activity_percentage == 100:
+                should_reply = True
+                logger.info(f"Processing group {message_type} from {user_name} ({user_id}). Reason: Activity is 100%.")
+            # Если активность < 100%, но прошла проверка, ищем упоминание/ответ
+            else:
+                try:
+                    bot_info = await context.bot.get_me()
+                    bot_id = bot_info.id
+                    bot_uname = bot_info.username
+                except Exception as e:
+                    logger.error(f"Failed getting bot info: {e}")
+                    bot_id = None
+                    bot_uname = settings.BOT_NAME
+                mentioned = (bot_uname and f"@{bot_uname}".lower() in prompt_input_text.lower()) or \
+                            settings.BOT_NAME.lower() in prompt_input_text.lower()
+                replied = update.message.reply_to_message and update.message.reply_to_message.from_user and update.message.reply_to_message.from_user.id == bot_id
+
+                if mentioned or replied:
+                    should_reply = True
+                    logger.info(f"Processing group {message_type} from {user_name} ({user_id}). Reason: M={mentioned}, R={replied} (Activity {bot_activity_percentage}%)")
+                else:
+                    logger.info(f"Ignoring group {message_type} from {user_name} ({user_id}) (no mention/reply, Activity {bot_activity_percentage}%).")
+        else: # Не прошли проверку активности (< 100%)
+            logger.debug(f"Skipping group msg from {user_id} due to activity ({bot_activity_percentage}%).")
+
 
         if should_reply:
             style = await _get_effective_style(chat_id, user_id, user_name, chat_type)
+            # Сообщение для системы остается прежним, оно определяет стиль ответа, а не условия ответа
             sys_msg = f"{style} Ты - {settings.BOT_NAME}. Отвечаешь в группе. Обращайся к {user_name}. Не начинай ответ с приветствия."
             topic = await asyncio.to_thread(get_user_topic_from_db, user_id); topic_ctx = f"Тема {user_name}: {topic}." if topic else ""
             history_deque = chat_history.get(history_key, deque(maxlen=settings.MAX_HISTORY))
@@ -229,6 +257,7 @@ async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_
 
     # --- Запуск извлечения фактов (опционально, можно вынести в Job) ---
     # asyncio.create_task(extract_and_save_facts(history_key))
+
 
 # --- Обработчик фото ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -304,6 +333,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error handling photo for {user_id} in {chat_id}: {e}", exc_info=True)
         try: await update.message.reply_text("Ошибка при обработке фото.")
         except Exception as send_e: logger.error(f"Failed sending photo error msg to {chat_id}: {send_e}")
+
 
 # --- Переназначение обработчиков ---
 handle_message = handle_text_voice_video

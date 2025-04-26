@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 # bot_commands.py
 import asyncio
-import json
 import re # Импортируем re для экранирования
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile, constants
 from telegram.ext import ContextTypes, CallbackContext, CommandHandler, CallbackQueryHandler, filters
@@ -267,9 +266,8 @@ async def reset_style_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     msg=update.message; user = update.effective_user
     if not msg or not user: return
     initial_style = settings._initial_default_style; settings.update_default_style(initial_style)
-    await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), bot_activity_percentage)
     escaped = escape_markdown_v2(initial_style)
-    await msg.reply_text(f"✅ Глобальный стиль сброшен:\n```\n{escaped}\n```", parse_mode='MarkdownV2'); logger.info(f"Admin {user.id} reset global style.")
+    await msg.reply_text(f"✅ Глобальный стиль сброшен \\(до значения из config/env\\):\n```\n{escaped}\n```", parse_mode='MarkdownV2'); logger.info(f"Admin {user.id} reset global style in memory.")
 
 @admin_only
 async def clear_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -393,8 +391,8 @@ async def set_default_style_command(update: Update, context: ContextTypes.DEFAUL
     if not context.args: await msg.reply_text("Укажите стиль: `/set_default_style <стиль>`"); return
     style = " ".join(context.args).strip()
     if style:
-        settings.update_default_style(style); await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), bot_activity_percentage)
-        escaped = escape_markdown_v2(style); await msg.reply_text(f"✅ Стиль по умолчанию:\n```\n{escaped}\n```", parse_mode='MarkdownV2'); logger.info(f"Admin {user.id} set global style.")
+        settings.update_default_style(style)
+        escaped = escape_markdown_v2(style); await msg.reply_text(f"✅ Стиль по умолчанию изменен \\(только для текущей сессии\\):\n```\n{escaped}\n```", parse_mode='MarkdownV2'); logger.info(f"Admin {user.id} set global style in memory.")
     else: await msg.reply_text("Стиль не пустой\\.")
 
 @admin_only
@@ -404,7 +402,8 @@ async def set_bot_name_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not context.args: await msg.reply_text("Укажите имя: `/set_bot_name <имя>`"); return
     name = " ".join(context.args).strip()
     if name:
-        settings.update_bot_name(name); await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), bot_activity_percentage)
+        settings.update_bot_name(name)
+        await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), bot_activity_percentage)
         await msg.reply_text(f"✅ Имя бота: *{escape_markdown_v2(settings.BOT_NAME)}*", parse_mode='MarkdownV2'); logger.info(f"Admin {user.id} set bot name to '{settings.BOT_NAME}'.")
     else: await msg.reply_text("Имя не пустое\\.")
 

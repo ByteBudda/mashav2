@@ -16,26 +16,24 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 MISTRAL_API_KEY = os.getenv('MISTRAL_API_KEY') # Добавили ключ Mistral
 ADMIN_USER_IDS = list(map(int, os.getenv('ADMIN_IDS', '').split(','))) if os.getenv('ADMIN_IDS') else []
-# NEW formatter WITH timestamp:
-formatter = logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s', # Added %(asctime)s and potentially %(name)s
-    datefmt='%Y-%m-%d %H:%M:%S' # Optional: Define the timestamp format
-)
-# --- END OF CHANGE ---
 
 # --- Класс настроек бота ---
 class BotSettings:
     def __init__(self):
         # Загружаем значения из .env или используем значения по умолчанию
-        self._initial_max_history = int(os.getenv('MAX_HISTORY', '30'))
-        self._initial_default_style = os.getenv('DEFAULT_STYLE', "Ты - Маша, 25-летняя девушка. Отвечай от первого лица, как будто ты - Маша.Подстраивайся под стиль общения собеседника")
+        self._initial_max_history = int(os.getenv('MAX_HISTORY', '15'))
+        self._initial_default_style = os.getenv('DEFAULT_STYLE', "Ты - Маша, 25-летняя девушка из Ростова Великого. Отвечай от первого лица, как будто ты - Маша. Подстраивайся под стиль общения собеседника")
         self._initial_bot_name = os.getenv('BOT_NAME', 'Маша')
         self._initial_history_ttl = int(os.getenv('HISTORY_TTL', '86400')) # Время жизни истории в памяти/SQLite
-        self._initial_gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash')
+        self._initial_gemini_model = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
         # Настройки генерации Gemini по умолчанию
         self._default_gemini_generation_config = {
             "temperature": 0.7, "top_p": 0.95, "top_k": 40,
         }
+        # Настройки для случайных сообщений
+        self._initial_enable_random_messages = os.getenv('ENABLE_RANDOM_MESSAGES', 'False').lower() == 'true'
+        self._initial_random_message_interval_hours = int(os.getenv('RANDOM_MESSAGE_INTERVAL_HOURS', '6'))
+        self._initial_random_message_history_context_count = int(os.getenv('RANDOM_MESSAGE_HISTORY_CONTEXT_COUNT', '10'))
 
         self.MAX_HISTORY = self._initial_max_history
         self.DEFAULT_STYLE = self._initial_default_style
@@ -44,6 +42,10 @@ class BotSettings:
         self.GEMINI_MODEL = self._initial_gemini_model
         # Инициализируем настройки генерации
         self.GEMINI_GENERATION_CONFIG = self._default_gemini_generation_config.copy()
+        # Инициализируем настройки случайных сообщений
+        self.ENABLE_RANDOM_MESSAGES = self._initial_enable_random_messages
+        self.RANDOM_MESSAGE_INTERVAL_HOURS = self._initial_random_message_interval_hours
+        self.RANDOM_MESSAGE_HISTORY_CONTEXT_COUNT = self._initial_random_message_history_context_count
 
 
     def update_default_style(self, new_style: str):
@@ -62,12 +64,15 @@ class BotSettings:
         self.HISTORY_TTL = self._initial_history_ttl
         self.GEMINI_MODEL = self._initial_gemini_model
         self.GEMINI_GENERATION_CONFIG = self._default_gemini_generation_config.copy()
+        self.ENABLE_RANDOM_MESSAGES = self._initial_enable_random_messages
+        self.RANDOM_MESSAGE_INTERVAL_HOURS = self._initial_random_message_interval_hours
+        self.RANDOM_MESSAGE_HISTORY_CONTEXT_COUNT = self._initial_random_message_history_context_count
         logger.info("Bot settings reset to initial values in memory.")
 
     def load_from_db(self, db_settings: dict):
         """Загружает настройки из словаря, полученного из БД."""
         self.MAX_HISTORY = int(db_settings.get('MAX_HISTORY', self._initial_max_history))
-        self.DEFAULT_STYLE = db_settings.get('DEFAULT_STYLE', self._initial_default_style)
+        # self.DEFAULT_STYLE = db_settings.get('DEFAULT_STYLE', self._initial_default_style) # Removed loading from DB
         self.BOT_NAME = db_settings.get('BOT_NAME', self._initial_bot_name)
         self.HISTORY_TTL = int(db_settings.get('HISTORY_TTL', self._initial_history_ttl))
         self.GEMINI_MODEL = db_settings.get('GEMINI_MODEL', self._initial_gemini_model)
@@ -83,6 +88,17 @@ class BotSettings:
                 self.GEMINI_GENERATION_CONFIG = self._default_gemini_generation_config.copy()
         else: # Если в БД нет, используем дефолтные
              self.GEMINI_GENERATION_CONFIG = self._default_gemini_generation_config.copy()
+        # Загрузка настроек случайных сообщений
+        random_msg_val = db_settings.get('ENABLE_RANDOM_MESSAGES', self._initial_enable_random_messages)
+        if isinstance(random_msg_val, str):
+            self.ENABLE_RANDOM_MESSAGES = random_msg_val.lower() == 'true'
+        elif isinstance(random_msg_val, bool):
+            self.ENABLE_RANDOM_MESSAGES = random_msg_val
+        else: # Fallback
+            self.ENABLE_RANDOM_MESSAGES = bool(random_msg_val)
+
+        self.RANDOM_MESSAGE_INTERVAL_HOURS = int(db_settings.get('RANDOM_MESSAGE_INTERVAL_HOURS', self._initial_random_message_interval_hours))
+        self.RANDOM_MESSAGE_HISTORY_CONTEXT_COUNT = int(db_settings.get('RANDOM_MESSAGE_HISTORY_CONTEXT_COUNT', self._initial_random_message_history_context_count))
         logger.info("Bot settings loaded from DB data.")
         logger.debug(f"Loaded Gemini Config: {self.GEMINI_GENERATION_CONFIG}")
 
@@ -91,12 +107,15 @@ class BotSettings:
         """Возвращает словарь текущих настроек для сохранения в БД."""
         settings_dict = {
             "MAX_HISTORY": self.MAX_HISTORY,
-            "DEFAULT_STYLE": self.DEFAULT_STYLE,
+            # "DEFAULT_STYLE": self.DEFAULT_STYLE, # Removed saving to DB
             "BOT_NAME": self.BOT_NAME,
             "HISTORY_TTL": self.HISTORY_TTL,
             "GEMINI_MODEL": self.GEMINI_MODEL,
             # Сохраняем настройки генерации как JSON строку
-            "GEMINI_GENERATION_CONFIG": json.dumps(self.GEMINI_GENERATION_CONFIG)
+            "GEMINI_GENERATION_CONFIG": json.dumps(self.GEMINI_GENERATION_CONFIG),
+            "ENABLE_RANDOM_MESSAGES": self.ENABLE_RANDOM_MESSAGES,
+            "RANDOM_MESSAGE_INTERVAL_HOURS": self.RANDOM_MESSAGE_INTERVAL_HOURS,
+            "RANDOM_MESSAGE_HISTORY_CONTEXT_COUNT": self.RANDOM_MESSAGE_HISTORY_CONTEXT_COUNT
         }
         return settings_dict
 
@@ -121,7 +140,7 @@ VECTOR_SEARCH_K_HISTORY = int(os.getenv("VECTOR_SEARCH_K_HISTORY", 5)) # K дл�
 VECTOR_SEARCH_K_FACTS = int(os.getenv("VECTOR_SEARCH_K_FACTS", 3)) # K для фактов
 
 # --- LLM Context Settings ---
-CONTEXT_MAX_TOKENS = int(os.getenv("CONTEXT_MAX_TOKENS", 7000))
+CONTEXT_MAX_TOKENS = int(os.getenv("CONTEXT_MAX_TOKENS", 4000))
 # Модель токенизатора для подсчета токенов (может требовать `pip install transformers[sentencepiece]`)
 TOKENIZER_MODEL_NAME = os.getenv("TOKENIZER_MODEL_NAME", "ai-forever/sbert_large_mt_nlu_ru")
 

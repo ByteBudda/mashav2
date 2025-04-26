@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # state.py
-from cmath import e
 import os
 import json
 import time
@@ -10,12 +9,12 @@ import re
 from collections import deque
 from typing import Dict, Deque, Optional, Tuple, List, Any
 from telegram.ext import CallbackContext
-from datetime import datetime
+
 # --- Импорт клиента Mistral ---
 # Используем try-except на случай, если библиотека не установлена
 try:
-    from mistralai import MistralClient
-    from mistralai import ChatMessage
+    from mistralai.client import MistralClient
+    from mistralai.models.chat_completion import ChatMessage
     MISTRAL_AVAILABLE = True
 except ImportError:
     MistralClient = None # type: ignore
@@ -206,8 +205,10 @@ def save_bot_settings_to_db(current_settings: Dict[str, Any], activity: int):
 
 def load_active_histories_from_db():
     """Загружает недавние истории чатов в память (deque)."""
-    chat_history.clear(); last_activity.clear()
+    global chat_history, last_activity; chat_history.clear(); last_activity.clear()
+    # Загружаем историю только за последний TTL, чтобы не переполнять память при старте
     cutoff_time = time.time() - settings.HISTORY_TTL
+    # Получаем последнюю временную метку для каждого активного чата
     active_keys_rows = _execute_db("SELECT history_key, MAX(timestamp) as last_ts FROM history WHERE timestamp > ? GROUP BY history_key", (cutoff_time,), fetch_all=True)
     if active_keys_rows is None: logger.error("Could not load active history keys."); return
     active_keys = {row['history_key']: row['last_ts'] for row in active_keys_rows}
@@ -216,25 +217,13 @@ def load_active_histories_from_db():
     try:
          conn = get_db_connection(); cursor = conn.cursor()
          for key, last_ts in active_keys.items():
-             # --- ИЗМЕНЕНИЕ НАЧАЛО ---
-             # Загружаем последние MAX_HISTORY сообщений И ИХ ВРЕМЕННЫЕ МЕТКИ
-             cursor.execute("SELECT role, user_name, message, timestamp FROM history WHERE history_key = ? ORDER BY timestamp DESC LIMIT ?", (key, settings.MAX_HISTORY))
-             # --- ИЗМЕНЕНИЕ КОНЕЦ ---
+             # Загружаем последние MAX_HISTORY сообщений для каждого активного ключа
+             cursor.execute("SELECT role, user_name, message FROM history WHERE history_key = ? ORDER BY timestamp DESC LIMIT ?", (key, settings.MAX_HISTORY))
              entries = cursor.fetchall()
              if entries:
-                 # --- ИЗМЕНЕНИЕ НАЧАЛО ---
-                 # Создаем deque с кортежами из 4 элементов (role, user_name, message, timestamp_str)
-                 dq_entries = []
-                 for r in reversed(entries): # Идем от старых к новым
-                     ts_float = r['timestamp']
-                     ts_str = datetime.fromtimestamp(ts_float).strftime("%Y-%m-%d %H:%M:%S")
-                     dq_entries.append((r['role'], r['user_name'], r['message'], ts_str))
-
-                 dq = deque(dq_entries, maxlen=settings.MAX_HISTORY)
-                 # --- ИЗМЕНЕНИЕ КОНЕЦ ---
-                 chat_history[key] = dq
-                 last_activity[key] = last_ts # Сохраняем последнее время активности (Unix timestamp)
-                 loaded_count += 1
+                 # Создаем deque с правильным maxlen и заполняем в хронологическом порядке
+                 dq = deque(((r['role'], r['user_name'], r['message']) for r in reversed(entries)), maxlen=settings.MAX_HISTORY)
+                 chat_history[key] = dq; last_activity[key] = last_ts; loaded_count += 1
     except sqlite3.Error as e: logger.error(f"DB error loading history entries: {e}")
     finally:
         if conn: conn.close()
@@ -250,22 +239,20 @@ def save_all_histories_to_db():
     try:
         conn = get_db_connection(); cursor = conn.cursor(); conn.execute("BEGIN TRANSACTION")
         for key in keys:
-            if key not in chat_history: continue
-            dq = chat_history[key]; ts = last_activity.get(key, time.time())
-            # --- ИЗМЕНЕНИЕ НАЧАЛО ---
-            for role, uname, msg, _ in list(dq): # Распаковываем 4 элемента, игнорируем ts_str
-            # --- ИЗМЕНЕНИЕ КОНЕЦ ---
-                # Проверяем наличие перед вставкой, используя ts из last_activity (как было)
-                cursor.execute("INSERT INTO history (history_key, role, user_name, message, timestamp) SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM history WHERE history_key = ? AND role = ? AND message = ? AND abs(timestamp - ?) < 0.1)", (key, role, uname, msg, ts, key, role, msg, ts))
+            if key not in chat_history: continue # Проверка на случай удаления ключа во время итерации
+            dq = chat_history[key]; ts = last_activity.get(key, time.time()) # Используем последнее известное время
+            for role, uname, msg in list(dq): # Копируем deque для безопасной итерации
+                # Проверяем наличие перед вставкой, чтобы избежать дублей
+                cursor.execute("INSERT INTO history (history_key, role, user_name, message, timestamp) SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM history WHERE history_key = ? AND role = ? AND message = ? AND abs(timestamp - ?) < 0.1)", (key, role, uname, msg, ts, key, role, msg, ts)) # Увеличили допуск времени
                 if cursor.rowcount > 0: saved_count += 1
-        conn.commit(); logger.info(f"Saved {saved_count} potentially new history entries to SQLite.")    
+        conn.commit(); logger.info(f"Saved {saved_count} potentially new history entries to SQLite.")
     except sqlite3.Error as e:
-            logger.error(f"DB error saving history transaction: {e}")
-            if conn:
-                conn.rollback()
+        logger.error(f"DB error saving history transaction: {e}")
+        if conn:
+            conn.rollback()
     finally:
-            if conn:
-                conn.close()
+        
+        if conn: conn.close()
 
 
 # --- Функции для пользовательских данных ---
@@ -389,46 +376,21 @@ async def extract_and_save_facts(history_key: int):
 
     logger.info(f"Starting fact extraction for history_key {history_key} using Mistral...")
     limit = settings.MAX_HISTORY * 3
-    # --- ИЗМЕНЕНИЕ НАЧАЛО ---
-    # Запрашиваем временную метку из БД
-    recent_messages_rows = await asyncio.to_thread(
-        _execute_db,
-        "SELECT role, message, timestamp FROM history WHERE history_key = ? ORDER BY timestamp DESC LIMIT ?",
-        (history_key, limit), fetch_all=True
-    )
-    # --- ИЗМЕНЕНИЕ КОНЕЦ ---
+    recent_messages_rows = await asyncio.to_thread(_execute_db, "SELECT role, message FROM history WHERE history_key = ? ORDER BY timestamp DESC LIMIT ?", (history_key, limit), fetch_all=True)
     if not recent_messages_rows: logger.info(f"No recent history for fact extraction (key={history_key})."); return
 
-    # --- ИЗМЕНЕНИЕ НАЧАЛО ---
-    # Формируем текст диалога с временными метками
-    dialog_lines = []
-    for row in reversed(recent_messages_rows):
-        ts_str = datetime.datetime.fromtimestamp(row['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
-        dialog_lines.append(f"[{ts_str}] {row['role']}: {row['message']}")
-    dialog_text = "\n".join(dialog_lines)
-    # --- ИЗМЕНЕНИЕ КОНЕЦ ---
+    dialog_text = "\n".join([f"{row['role']}: {row['message']}" for row in reversed(recent_messages_rows)])
+    max_dialog_chars = 6000
+    if len(dialog_text) > max_dialog_chars: logger.warning(f"Dialog text too long ({len(dialog_text)}), truncating."); dialog_text = dialog_text[-max_dialog_chars:]
 
-    max_dialog_chars = 6000 # Увеличим, т.к. метки добавляют длину
-    if len(dialog_text) > max_dialog_chars:
-        logger.warning(f"Dialog text too long ({len(dialog_text)}), truncating for Mistral.")
-        # Обрезаем С НАЧАЛА (старые сообщения), чтобы сохранить последние
-        lines_to_keep = []
-        current_len = 0
-        for line in reversed(dialog_lines):
-            line_len = len(line) + 1 # +1 for newline
-            if current_len + line_len <= max_dialog_chars:
-                lines_to_keep.append(line)
-                current_len += line_len
-            else:
-                break
-        dialog_text = "\n".join(reversed(lines_to_keep))
     fact_extraction_prompt = f"""Проанализируй диалог (history_key={history_key}). Извлеки ТОЛЬКО ключевые факты в формате JSON. Категории: 'user_preferences', 'user_attributes', 'mentioned_people', 'mentioned_places', 'key_topics', 'agreements'. Правила: ТОЛЬКО JSON, пустые списки [], без выдумок. Диалог:\n{dialog_text}\n\nJSON_OUTPUT:"""
+
     extracted_data = None
     try:
         client = MistralClient(api_key=MISTRAL_API_KEY)
         logger.debug(f"Sending fact extraction prompt to Mistral (key={history_key})...")
         chat_response = await client.chat(
-            model="mistral-large-latest", messages=[ChatMessage(role="user", content=fact_extraction_prompt)],
+            model="mistral-small-latest", messages=[ChatMessage(role="user", content=fact_extraction_prompt)],
             temperature=0.1, response_format={"type": "json_object"}
         )
         json_response_str = chat_response.choices[0].message.content
@@ -495,17 +457,15 @@ async def fact_extraction_job(context: CallbackContext):
 # --- Функции управления состоянием ---
 def add_to_memory_history(key: int, role: str, message: str, user_name: Optional[str] = None):
     """Добавляет сообщение в историю чата (только в памяти) и обновляет время активности."""
+    global chat_history, last_activity
     if key not in chat_history: chat_history[key] = deque(maxlen=settings.MAX_HISTORY)
-    now = time.time()
-    ts_str = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S")
-    entry = (role, user_name, message, ts_str) # Теперь 4 элемента
-    chat_history[key].append(entry)
-    last_activity[key] = now # Обновляем время последней активности Unix timestamp'ом
+    entry = (role, user_name, message); chat_history[key].append(entry); last_activity[key] = time.time()
     logger.debug(f"Mem-History add: key={key}, role={role}, size={len(chat_history[key])}")
+
 
 async def cleanup_history_job(context):
     """Периодическая задача для удаления старой истории и ФАКТОВ."""
-    current_time = time.time()
+    global chat_history, last_activity; current_time = time.time()
     keys_to_delete_mem = [k for k, ts in last_activity.items() if current_time - ts > settings.HISTORY_TTL]
     deleted_mem_cnt = 0
     for key in keys_to_delete_mem:
@@ -570,3 +530,27 @@ async def cleanup_history_job(context):
 
     if deleted_mem_cnt == 0 and (deleted_db_count is None or deleted_db_count == 0):
         logger.debug("History cleanup: No inactive memory or old DB entries found.")
+
+
+# --- Новые синхронные функции для получения данных для случайных сообщений ---
+
+def _get_recent_active_group_chat_ids_sync() -> List[int]:
+    """Возвращает список ID активных групповых чатов (за последний TTL)."""
+    cutoff_time = time.time() - settings.HISTORY_TTL
+    # Выбираем уникальные отрицательные history_key (ID групп), где есть сообщения новее cutoff_time
+    rows = _execute_db("SELECT DISTINCT history_key FROM history WHERE history_key < 0 AND timestamp > ?", (cutoff_time,), fetch_all=True)
+    if rows is None: # Ошибка БД
+        logger.error("Failed to query recent active group chat IDs.")
+        return []
+    ids = [row['history_key'] for row in rows]
+    logger.debug(f"Found {len(ids)} active group chats within TTL.")
+    return ids
+
+def _get_recent_messages_sync(history_key: int, limit: int) -> List[Tuple[str, Optional[str], str]]:
+    """Возвращает последние 'limit' сообщений для заданного history_key."""
+    rows = _execute_db("SELECT role, user_name, message FROM history WHERE history_key = ? ORDER BY timestamp DESC LIMIT ?", (history_key, limit), fetch_all=True)
+    if rows is None: # Ошибка БД
+        logger.error(f"Failed to query recent messages for key {history_key}.")
+        return []
+    # Возвращаем в хронологическом порядке (старые первыми)
+    return [(row['role'], row['user_name'], row['message']) for row in reversed(rows)]

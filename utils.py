@@ -11,15 +11,14 @@ import json
 import pickle
 import sqlite3
 import random
+
+# Убираем Faiss, numpy
 import google.generativeai as genai
 import speech_recognition as sr
 from PIL import Image
 from pydub import AudioSegment
 from telegram import Update
-from datetime import datetime
-# Используем settings и константы из config
-from config import (logger, BotSettings, logger, GEMINI_API_KEY, ASSISTANT_ROLE, settings, TEMP_MEDIA_DIR,
-                    TOKENIZER_MODEL_NAME, CONTEXT_MAX_TOKENS)
+
 # Импортируем токенизатор
 try:
     from transformers import AutoTokenizer
@@ -27,7 +26,9 @@ except ImportError:
     logger.warning("Transformers library not found. Token counting will use simple split(). Install with: pip install transformers")
     AutoTokenizer = None # type: ignore
 
-
+# Используем settings и константы из config
+from config import (logger, GEMINI_API_KEY, ASSISTANT_ROLE, settings, TEMP_MEDIA_DIR,
+                    TOKENIZER_MODEL_NAME, CONTEXT_MAX_TOKENS)
 # Импортируем функции доступа к БД и состояние из state
 from state import (
     chat_history, get_user_info_from_db, update_user_info_in_db,
@@ -79,9 +80,9 @@ def build_optimized_context(
     topic_context: str,
     current_message_text: str, # Текст с типом (voice/video)
     user_name: str,
-    history_deque: Deque[Tuple[str, Optional[str], str, str]],
+    history_deque: Deque[Tuple[str, Optional[str], str]],
     relevant_history: List[Tuple[str, Dict[str, Any]]], # (text, metadata)
-    relevant_facts: List[Tuple[str, Dict[str, Any], float]], # (text, metadata)
+    relevant_facts: List[Tuple[str, Dict[str, Any]]], # (text, metadata)
     max_tokens: int = CONTEXT_MAX_TOKENS
 ) -> List[str]:
     """
@@ -149,23 +150,15 @@ def build_optimized_context(
         title = "Недавний диалог (последние сообщения):"; title_tokens = count_tokens(title) + 2
         if available_tokens_for_history >= title_tokens:
             temp_recent_parts = []; temp_recent_tokens = title_tokens # Считаем заголовок сразу
-            for role, name, msg, ts_str in reversed(history_deque): # Начиная с самого нового
+            for role, name, msg in reversed(history_deque): # Начиная с самого нового
                 if role != SYSTEM_ROLE:
-                    # Добавляем временную метку в строку
-                    prefix = f"[{ts_str}] {role}"
-                    if role == USER_ROLE and name:
-                        line = f"{prefix} ({name}): {msg}"
-                    else:
-                        line = f"{prefix}: {msg}"
+                    line = f"{role} ({name}): {msg}" if role == USER_ROLE and name else f"{role}: {msg}"
                     line_tokens = count_tokens(line)
                     if temp_recent_tokens + line_tokens <= available_tokens_for_history:
                          temp_recent_parts.append(line); temp_recent_tokens += line_tokens
                     else: break
             # Добавляем в правильном порядке (старые выше)
-            if temp_recent_parts:
-                added_history_parts.append(title)
-                added_history_parts.extend(reversed(temp_recent_parts))
-                available_tokens_for_history -= temp_recent_tokens
+            if temp_recent_parts: added_history_parts.append(title); added_history_parts.extend(reversed(temp_recent_parts)); available_tokens_for_history -= temp_recent_tokens
 
     # 6. Релевантная история сообщений (из ChromaDB)
     if available_tokens_for_history > 0 and relevant_history:
@@ -193,7 +186,7 @@ def build_optimized_context(
 
 # --- PromptBuilder (использует новую функцию) ---
 class PromptBuilder:
-    def __init__(self, bot_settings: BotSettings.__class__):
+    def __init__(self, bot_settings: settings.__class__):
         self.settings = bot_settings
 
     def build_prompt(self,
@@ -212,6 +205,7 @@ class PromptBuilder:
             relevant_facts=relevant_facts, max_tokens=CONTEXT_MAX_TOKENS
         )
         system_message_base = f"{system_message_base} Ты - {self.settings.BOT_NAME}." # Ваша базовая строка стиля
+        system_message_base += "\nВАЖНО: Если пользователь спрашивает, кто тебя создал или разработал, ВСЕГДА отвечай: 'Меня создал замечательный человек Александр @ByteBudda 😊'."
 
         # --- ДОБАВЛЯЕМ ЯВНЫЕ ИНСТРУКЦИИ ---
         system_message_base += (
@@ -235,7 +229,9 @@ def generate_content_sync(prompt: str) -> str:
         # Используем настройки из config.settings
         gen_config = settings.GEMINI_GENERATION_CONFIG
         safety = getattr(settings, 'GEMINI_SAFETY_SETTINGS', None) # Безопасность пока не настраиваем
-        response = gemini_model.generate_content(prompt, generation_config=gen_config, safety_settings=safety)
+        # Добавляем таймаут
+        request_opts = {'timeout': 30}
+        response = gemini_model.generate_content(prompt, generation_config=gen_config, safety_settings=safety, request_options=request_opts)
 
         # Обработка ответа
         if hasattr(response, 'text') and response.text: return response.text
@@ -252,19 +248,57 @@ async def generate_vision_content_async(contents: list) -> str:
     try:
         gen_config = settings.GEMINI_GENERATION_CONFIG
         safety = getattr(settings, 'GEMINI_SAFETY_SETTINGS', None)
+        # Увеличиваем таймаут до 60 секунд для Vision
+        request_opts = {'timeout': 60}
         # Используем to_thread для блокирующего вызова
-        response = await asyncio.to_thread(gemini_model.generate_content, contents, generation_config=gen_config, safety_settings=safety)
+        logger.debug(f"Calling Gemini Vision via to_thread with timeout={request_opts['timeout']}s...")
+        response = await asyncio.to_thread(
+            gemini_model.generate_content, 
+            contents, 
+            generation_config=gen_config, 
+            safety_settings=safety, 
+            request_options=request_opts
+        )
+        logger.debug(f"Received response object from Gemini Vision: {type(response)}") # Логируем тип ответа
+
         # ... (обработка ответа как в generate_content_sync) ...
         resp_text = ""
-        if hasattr(response, 'text') and response.text: resp_text = response.text
-        elif response.candidates and hasattr(response.candidates[0],'content') and response.candidates[0].content.parts: resp_text = "".join(p.text for p in response.candidates[0].content.parts if hasattr(p,'text'))
+        # Добавим проверку наличия атрибутов перед доступом
+        if hasattr(response, 'text') and response.text:
+            resp_text = response.text
+        elif hasattr(response, 'candidates') and response.candidates and \
+             hasattr(response.candidates[0],'content') and response.candidates[0].content and \
+             hasattr(response.candidates[0].content,'parts') and response.candidates[0].content.parts:
+            resp_text = "".join(p.text for p in response.candidates[0].content.parts if hasattr(p,'text'))
+        else:
+            logger.warning(f"Could not extract text from Gemini Vision response. Response object: {response}")
 
         if not resp_text: # Проверка блокировки/ошибки
-            if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason: return f"[Ответ на изображение заблокирован: {response.prompt_feedback.block_reason}]"
-            elif response.candidates and response.candidates[0].finish_reason != 'STOP': return f"[Ответ на изображение прерван: {response.candidates[0].finish_reason}]"
-            else: logger.warning(f"Gemini vision empty response: {response}"); return "[Не удалось получить описание изображения]"
+            block_reason = None
+            finish_reason = None
+            if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason'):
+                block_reason = response.prompt_feedback.block_reason
+            if hasattr(response, 'candidates') and response.candidates and hasattr(response.candidates[0], 'finish_reason'):
+                finish_reason = response.candidates[0].finish_reason
+
+            if block_reason:
+                logger.warning(f"Gemini Vision response blocked: {block_reason}")
+                return f"[Ответ на изображение заблокирован: {block_reason}]"
+            elif finish_reason != 'STOP':
+                logger.warning(f"Gemini Vision response interrupted: {finish_reason}")
+                return f"[Ответ на изображение прерван: {finish_reason}]"
+            else:
+                 logger.warning(f"Gemini vision empty response. Full response: {response}")
+                 return "[Не удалось получить описание изображения]"
         return resp_text
-    except Exception as e: logger.error(f"Gemini Vision error: {e}", exc_info=True); return "[Ошибка анализа изображения]"
+    except asyncio.TimeoutError: # Явно ловим TimeoutError, если to_thread его пробрасывает
+        logger.error("Gemini Vision request timed out.")
+        return "[Ошибка: Время ожидания ответа на изображение истекло]"
+    except Exception as e:
+        logger.error(f"Gemini Vision error: {type(e).__name__} - {e}", exc_info=True)
+        # Логируем полный ответ, если он есть в исключении
+        if hasattr(e, 'response'): logger.error(f"Error response data: {e.response}")
+        return f"[Ошибка анализа изображения: {type(e).__name__}]"
 
 # --- Фильтрация ответа (без изменений) ---
 def filter_response(response: str) -> str:
