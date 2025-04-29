@@ -9,12 +9,13 @@ import re
 from collections import deque
 from typing import Dict, Deque, Optional, Tuple, List, Any
 from telegram.ext import CallbackContext
+from datetime import datetime
 
 # --- Импорт клиента Mistral ---
 # Используем try-except на случай, если библиотека не установлена
 try:
-    from mistralai.client import MistralClient
-    from mistralai.models.chat_completion import ChatMessage
+    from mistralai import Mistral
+    from mistralai import ChatMessage
     MISTRAL_AVAILABLE = True
 except ImportError:
     MistralClient = None # type: ignore
@@ -32,7 +33,7 @@ from vector_db import (
 
 # --- Глобальное состояние бота (в памяти) ---
 # {history_key: deque([(role, user_name, message)])}
-chat_history: Dict[int, Deque[Tuple[str, Optional[str], str]]] = {}
+chat_history: Dict[int, Deque[Tuple[str, Optional[str], str, str]]] = {}
 last_activity: Dict[int, float] = {} # {history_key: timestamp}
 bot_activity_percentage: int = 100 # Процент активности в группах
 
@@ -155,6 +156,15 @@ def init_db():
                     updated_at REAL NOT NULL
                 ) WITHOUT ROWID;
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS provider_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider TEXT NOT NULL,
+                    avg_time REAL NOT NULL,
+                    error_count INTEGER NOT NULL,
+                    timestamp REAL NOT NULL
+                )
+            """)
             # --- Индексы ---
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_key_timestamp ON history (history_key, timestamp DESC);") # Индекс по ключу и времени
@@ -218,11 +228,16 @@ def load_active_histories_from_db():
          conn = get_db_connection(); cursor = conn.cursor()
          for key, last_ts in active_keys.items():
              # Загружаем последние MAX_HISTORY сообщений для каждого активного ключа
-             cursor.execute("SELECT role, user_name, message FROM history WHERE history_key = ? ORDER BY timestamp DESC LIMIT ?", (key, settings.MAX_HISTORY))
+             cursor.execute("SELECT role, user_name, message, timestamp FROM history WHERE history_key = ? ORDER BY timestamp DESC LIMIT ?", (key, settings.MAX_HISTORY))
              entries = cursor.fetchall()
              if entries:
                  # Создаем deque с правильным maxlen и заполняем в хронологическом порядке
-                 dq = deque(((r['role'], r['user_name'], r['message']) for r in reversed(entries)), maxlen=settings.MAX_HISTORY)
+                 dq_entries = []
+                 for r in reversed(entries):
+                     ts = datetime.fromtimestamp(r['timestamp']).strftime('%H:%M:%S') # Форматируем время
+                     dq_entries.append((r['role'], r['user_name'], r['message'], ts)) # Добавляем метку
+
+                 dq = deque(dq_entries, maxlen=settings.MAX_HISTORY)
                  chat_history[key] = dq; last_activity[key] = last_ts; loaded_count += 1
     except sqlite3.Error as e: logger.error(f"DB error loading history entries: {e}")
     finally:
@@ -241,7 +256,7 @@ def save_all_histories_to_db():
         for key in keys:
             if key not in chat_history: continue # Проверка на случай удаления ключа во время итерации
             dq = chat_history[key]; ts = last_activity.get(key, time.time()) # Используем последнее известное время
-            for role, uname, msg in list(dq): # Копируем deque для безопасной итерации
+            for role, uname, msg, _ in list(dq): # Распаковываем 4 элемента, игнорируя timestamp_str
                 # Проверяем наличие перед вставкой, чтобы избежать дублей
                 cursor.execute("INSERT INTO history (history_key, role, user_name, message, timestamp) SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM history WHERE history_key = ? AND role = ? AND message = ? AND abs(timestamp - ?) < 0.1)", (key, role, uname, msg, ts, key, role, msg, ts)) # Увеличили допуск времени
                 if cursor.rowcount > 0: saved_count += 1
@@ -286,6 +301,12 @@ def set_user_preferred_name_in_db(user_id: int, name: str):
 def get_user_topic_from_db(user_id: int) -> Optional[str]:
     r = _execute_db("SELECT topic FROM users WHERE user_id = ?", (user_id,), fetch_one=True)
     return r['topic'] if r and r['topic'] else None
+
+# --- Новая функция для получения текста сообщения по ID --- 
+def get_message_text_by_id(message_sqlite_id: int) -> Optional[str]:
+    """Получает текст сообщения из таблицы history по его SQLite ID."""
+    row = _execute_db("SELECT message FROM history WHERE id = ?", (message_sqlite_id,), fetch_one=True)
+    return row['message'] if row else None
 
 # --- Функции для стилей ---
 def get_group_style_from_db(chat_id: int) -> Optional[str]:
@@ -458,9 +479,11 @@ async def fact_extraction_job(context: CallbackContext):
 def add_to_memory_history(key: int, role: str, message: str, user_name: Optional[str] = None):
     """Добавляет сообщение в историю чата (только в памяти) и обновляет время активности."""
     global chat_history, last_activity
+    current_time = time.time()
+    timestamp_str = datetime.fromtimestamp(current_time).strftime('%H:%M:%S') # Форматируем время
     if key not in chat_history: chat_history[key] = deque(maxlen=settings.MAX_HISTORY)
-    entry = (role, user_name, message); chat_history[key].append(entry); last_activity[key] = time.time()
-    logger.debug(f"Mem-History add: key={key}, role={role}, size={len(chat_history[key])}")
+    entry = (role, user_name, message, timestamp_str); chat_history[key].append(entry); last_activity[key] = current_time # Добавили timestamp_str
+    logger.debug(f"Mem-History add: key={key}, role={role}, size={len(chat_history[key])}, time={timestamp_str}")
 
 
 async def cleanup_history_job(context):
@@ -546,11 +569,11 @@ def _get_recent_active_group_chat_ids_sync() -> List[int]:
     logger.debug(f"Found {len(ids)} active group chats within TTL.")
     return ids
 
-def _get_recent_messages_sync(history_key: int, limit: int) -> List[Tuple[str, Optional[str], str]]:
-    """Возвращает последние 'limit' сообщений для заданного history_key."""
-    rows = _execute_db("SELECT role, user_name, message FROM history WHERE history_key = ? ORDER BY timestamp DESC LIMIT ?", (history_key, limit), fetch_all=True)
+def _get_recent_messages_sync(history_key: int, limit: int) -> List[Tuple[str, Optional[str], str, float]]:
+    """Возвращает последние 'limit' сообщений для заданного history_key, включая timestamp."""
+    rows = _execute_db("SELECT role, user_name, message, timestamp FROM history WHERE history_key = ? ORDER BY timestamp DESC LIMIT ?", (history_key, limit), fetch_all=True)
     if rows is None: # Ошибка БД
         logger.error(f"Failed to query recent messages for key {history_key}.")
         return []
     # Возвращаем в хронологическом порядке (старые первыми)
-    return [(row['role'], row['user_name'], row['message']) for row in reversed(rows)]
+    return [(row['role'], row['user_name'], row['message'], row['timestamp']) for row in reversed(rows)]

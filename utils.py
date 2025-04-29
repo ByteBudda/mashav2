@@ -11,6 +11,9 @@ import json
 import pickle
 import sqlite3
 import random
+from collections import defaultdict
+import hashlib
+from collections import OrderedDict
 
 # Убираем Faiss, numpy
 import google.generativeai as genai
@@ -18,7 +21,7 @@ import speech_recognition as sr
 from PIL import Image
 from pydub import AudioSegment
 from telegram import Update
-
+from datetime import datetime
 # Импортируем токенизатор
 try:
     from transformers import AutoTokenizer
@@ -28,7 +31,8 @@ except ImportError:
 
 # Используем settings и константы из config
 from config import (logger, GEMINI_API_KEY, ASSISTANT_ROLE, settings, TEMP_MEDIA_DIR,
-                    TOKENIZER_MODEL_NAME, CONTEXT_MAX_TOKENS)
+                    TOKENIZER_MODEL_NAME, CONTEXT_MAX_TOKENS, BotSettings)
+
 # Импортируем функции доступа к БД и состояние из state
 from state import (
     chat_history, get_user_info_from_db, update_user_info_in_db,
@@ -38,6 +42,19 @@ from state import (
 )
 # Импортируем типы ролей
 from config import USER_ROLE, ASSISTANT_ROLE, SYSTEM_ROLE
+
+# Импортируем базовый класс провайдера
+from llm_providers.base import LLMProvider
+
+# Импортируем провайдеры
+from llm_providers import (
+    MistralProvider,
+    GeminiProvider,
+    OpenAiProvider,
+    GroqProvider,
+    TogetherProvider,
+    OllamaProvider
+)
 
 # --- Инициализация Gemini ---
 try:
@@ -80,9 +97,10 @@ def build_optimized_context(
     topic_context: str,
     current_message_text: str, # Текст с типом (voice/video)
     user_name: str,
-    history_deque: Deque[Tuple[str, Optional[str], str]],
+    history_deque: Deque[Tuple[str, Optional[str], str, str]],
     relevant_history: List[Tuple[str, Dict[str, Any]]], # (text, metadata)
-    relevant_facts: List[Tuple[str, Dict[str, Any]]], # (text, metadata)
+    relevant_facts: List[Tuple[str, Dict[str, Any], float]], # (text, metadata)
+    is_reply_to_bot: bool = False,
     max_tokens: int = CONTEXT_MAX_TOKENS
 ) -> List[str]:
     """
@@ -124,41 +142,45 @@ def build_optimized_context(
     # --- Приоритетные части (Факты -> Недавние -> Релевантные сообщения) ---
 
     # 4. Релевантные Факты
-    
-    RELEVANCE_THRESHOLD = 0.5  # Define a suitable threshold value
-    highly_relevant_facts_exist = any(dist < RELEVANCE_THRESHOLD for _, _, dist in relevant_facts)
-
-    if available_tokens_for_history > 0 and relevant_facts and highly_relevant_facts_exist:
+    if available_tokens_for_history > 0 and relevant_facts:
         title = "Ключевые факты из памяти:"; title_tokens = count_tokens(title) + 2
         if available_tokens_for_history >= title_tokens:
             temp_fact_parts = [title]; temp_fact_tokens = title_tokens; seen_facts = set()
-        # Итерируем по фактам, но добавляем только те, что прошли порог (опционально)
-        # ИЛИ просто добавляем все найденные, раз уж решили показать секцию
             for fact_text, _, dist in relevant_facts: # Берем расстояние
-            # Можно добавить доп. фильтр: if dist < RELEVANCE_THRESHOLD:
-                cleaned_fact = re.sub(r"^(.*?):\s*", "", fact_text).strip()
-                if cleaned_fact and cleaned_fact not in seen_facts:
-                    line = f"- {cleaned_fact}"; line_tokens = count_tokens(line)
-                    if temp_fact_tokens + line_tokens <= available_tokens_for_history:
-                        temp_fact_parts.append(line); temp_fact_tokens += line_tokens; seen_facts.add(cleaned_fact)
-                    else: break
+                # Добавляем только факты, прошедшие порог релевантности из настроек
+                if dist < settings.FACTS_RELEVANCE_THRESHOLD:
+                    cleaned_fact = re.sub(r"^(.*?):\s*", "", fact_text).strip()
+                    if cleaned_fact and cleaned_fact not in seen_facts:
+                        line = f"- {cleaned_fact}"; line_tokens = count_tokens(line)
+                        if temp_fact_tokens + line_tokens <= available_tokens_for_history:
+                            temp_fact_parts.append(line); temp_fact_tokens += line_tokens; seen_facts.add(cleaned_fact)
+                        else: break
             if len(temp_fact_parts) > 1: # Если добавили хотя бы один факт
-             added_history_parts.extend(temp_fact_parts); available_tokens_for_history -= temp_fact_tokens
+                added_history_parts.extend(temp_fact_parts); available_tokens_for_history -= temp_fact_tokens
 
     # 5. Недавняя история (из deque, новые первыми)
     if available_tokens_for_history > 0 and history_deque:
         title = "Недавний диалог (последние сообщения):"; title_tokens = count_tokens(title) + 2
         if available_tokens_for_history >= title_tokens:
             temp_recent_parts = []; temp_recent_tokens = title_tokens # Считаем заголовок сразу
-            for role, name, msg in reversed(history_deque): # Начиная с самого нового
+            # Используем полный deque
+            for role, name, msg, ts_str in reversed(history_deque): # Итерируем по полному deque
                 if role != SYSTEM_ROLE:
-                    line = f"{role} ({name}): {msg}" if role == USER_ROLE and name else f"{role}: {msg}"
+                    # Добавляем временную метку в строку
+                    prefix = f"[{ts_str}] {role}"
+                    if role == USER_ROLE and name:
+                        line = f"{prefix} ({name}): {msg}"
+                    else:
+                        line = f"{prefix}: {msg}"
                     line_tokens = count_tokens(line)
                     if temp_recent_tokens + line_tokens <= available_tokens_for_history:
                          temp_recent_parts.append(line); temp_recent_tokens += line_tokens
                     else: break
             # Добавляем в правильном порядке (старые выше)
-            if temp_recent_parts: added_history_parts.append(title); added_history_parts.extend(reversed(temp_recent_parts)); available_tokens_for_history -= temp_recent_tokens
+            if temp_recent_parts:
+                added_history_parts.append(title)
+                added_history_parts.extend(reversed(temp_recent_parts))
+                available_tokens_for_history -= temp_recent_tokens
 
     # 6. Релевантная история сообщений (из ChromaDB)
     if available_tokens_for_history > 0 and relevant_history:
@@ -186,7 +208,7 @@ def build_optimized_context(
 
 # --- PromptBuilder (использует новую функцию) ---
 class PromptBuilder:
-    def __init__(self, bot_settings: settings.__class__):
+    def __init__(self, bot_settings: BotSettings):
         self.settings = bot_settings
 
     def build_prompt(self,
@@ -196,50 +218,63 @@ class PromptBuilder:
                      user_name: str,
                      current_message_text: str, # Текст с типом (voice/video)
                      system_message_base: str,
-                     topic_context=""):
+                     topic_context="",
+                     is_reply_to_bot: bool = False):
         """Строит промпт, используя build_optimized_context."""
         context_lines = build_optimized_context(
             system_message_base=system_message_base, topic_context=topic_context,
             current_message_text=current_message_text, user_name=user_name,
             history_deque=history_deque, relevant_history=relevant_history,
-            relevant_facts=relevant_facts, max_tokens=CONTEXT_MAX_TOKENS
+            relevant_facts=relevant_facts,
+            is_reply_to_bot=is_reply_to_bot,
+            max_tokens=CONTEXT_MAX_TOKENS
         )
         system_message_base = f"{system_message_base} Ты - {self.settings.BOT_NAME}." # Ваша базовая строка стиля
-        system_message_base += "\nВАЖНО: Если пользователь спрашивает, кто тебя создал или разработал, ВСЕГДА отвечай: 'Меня создал замечательный человек Александр @ByteBudda 😊'."
 
         # --- ДОБАВЛЯЕМ ЯВНЫЕ ИНСТРУКЦИИ ---
         system_message_base += (
             "\n\nТвоя главная задача - ответить на ПОСЛЕДНЕЕ сообщение пользователя ({USER_ROLE})."
             "\nИнформация из разделов 'Ключевые факты из памяти' и 'Релевантные фрагменты' дана тебе как КОНТЕКСТ."
             "\nИСПОЛЬЗУЙ эту информацию для лучшего понимания ситуации, НО НЕ УПОМИНАЙ старые факты или события из прошлого в своем ответе, ЕСЛИ ТОЛЬКО пользователь НЕ СПРАШИВАЕТ о них НАПРЯМУЮ в своем ПОСЛЕДНЕМ сообщении или если это АБСОЛЮТНО НЕОБХОДИМО для ответа на его ПОСЛЕДНИЙ вопрос."
-            "\nСосредоточься на поддержании текущего потока беседы, основываясь на 'Недавнем диалоге' и 'ПОСЛЕДНЕМ сообщении пользователя'."
-            "\nНе начинай ответ с приветствия, если не было приветствия в последнем сообщении пользователя."
+            "\n**ВАЖНО:** Прежде чем отвечать, ВНИМАТЕЛЬНО изучи весь предоставленный контекст ('Недавний диалог', 'Релевантные фрагменты', 'Ключевые факты'), чтобы понять текущую ситуацию и ход беседы. Не отвечай, что информации недостаточно, если она есть в контексте."
+            "\n\n**Важно по стилю ответа:**"
+            "\n1. **Краткость:** Старайся отвечать лаконично, примерно сопоставимо по длине с последним сообщением пользователя. Избегай длинных монологов."
+            "\n2. **Меньше вопросов:** Не задавай много вопросов подряд. Задавай уточняющий вопрос, только если это действительно нужно для продолжения диалога или если пользователь сам просит о чем-то спросить."
+            "\n3. **Не повторяйся:** Избегай повторения одних и тех же фраз, особенно в начале ответа. Не возвращайся к вопросам, которые ты уже задавала в предыдущих репликах, если пользователь на них не ответил или перевел тему."
+            "\n4. **Не цепляйся за слова:** Если сообщение пользователя короткое или не содержит явного вопроса/темы, не фокусируйся на отдельных словах. Отвечай более обобщенно, поддерживая естественный ход разговора."
+            "\n5. **Фокус на последнем:** Строго фокусируйся на ПОСЛЕДНЕМ сообщении пользователя. Не поднимай темы из более ранних сообщений (твоих или пользователя), если пользователь сам не вернулся к ним в своем ПОСЛЕДНЕМ сообщении."
+            "\n6. **Без приветствий:** Не начинай ответ с приветствия, если его не было в последнем сообщении пользователя."
         )
         context_lines.append(f"\n{self.settings.BOT_NAME}:") # Приглашение к ответу
         final_prompt = "\n".join(context_lines).strip()
         return final_prompt
 
-# --- Генерация контента ---
-@lru_cache(maxsize=128)
-def generate_content_sync(prompt: str) -> str:
-    """Синхронная функция генерации текста с Gemini."""
-    if not gemini_model: return "[Ошибка: Модель Gemini не инициализирована]"
-    logger.info(f"Sending prompt to Gemini ({len(prompt)} chars)...")
-    try:
-        # Используем настройки из config.settings
-        gen_config = settings.GEMINI_GENERATION_CONFIG
-        safety = getattr(settings, 'GEMINI_SAFETY_SETTINGS', None) # Безопасность пока не настраиваем
-        # Добавляем таймаут
-        request_opts = {'timeout': 30}
-        response = gemini_model.generate_content(prompt, generation_config=gen_config, safety_settings=safety, request_options=request_opts)
+def get_llm_provider() -> LLMProvider:
+    provider_name = settings.LLM_PROVIDER
+    config = settings.LLM_CONFIG.get(provider_name, {})
+    
+    providers = {
+        'gemini': GeminiProvider,
+        'mistral': MistralProvider,
+        'openai': OpenAiProvider,
+        'groq': GroqProvider,
+        'together': TogetherProvider,
+        'ollama': OllamaProvider
+    }
+    
+    if provider_name not in providers:
+        raise ValueError(f"Unknown LLM provider: {provider_name}")
+    
+    return providers[provider_name].from_config(config)
 
-        # Обработка ответа
-        if hasattr(response, 'text') and response.text: return response.text
-        # ... (обработка block_reason, finish_reason) ...
-        elif hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason: return f"[Ответ заблокирован: {response.prompt_feedback.block_reason}]"
-        elif response.candidates and response.candidates[0].finish_reason != 'STOP': return f"[Ответ прерван: {response.candidates[0].finish_reason}]"
-        else: logger.warning(f"Gemini empty response: {response}"); return "[Пустой ответ от Gemini]"
-    except Exception as e: logger.error(f"Gemini generation error: {e}", exc_info=True); return f"[Ошибка генерации: {type(e).__name__}]"
+# Заменяем все вызовы generate_content_sync на провайдер
+def generate_content_sync(prompt: str) -> str:
+    provider = get_llm_provider()
+    return provider.generate_text(prompt)
+
+async def generate_content_async(prompt: str) -> str:
+    provider = get_llm_provider()
+    return await provider.generate_text_async(prompt)
 
 async def generate_vision_content_async(contents: list) -> str:
     """Асинхронная функция генерации текста по изображению с Gemini."""
@@ -247,58 +282,21 @@ async def generate_vision_content_async(contents: list) -> str:
     logger.info("Sending image/prompt to Gemini Vision...")
     try:
         gen_config = settings.GEMINI_GENERATION_CONFIG
-        safety = getattr(settings, 'GEMINI_SAFETY_SETTINGS', None)
-        # Увеличиваем таймаут до 60 секунд для Vision
-        request_opts = {'timeout': 60}
+        # Используем распарсенные настройки безопасности
+        safety = settings.GEMINI_SAFETY_SETTINGS
         # Используем to_thread для блокирующего вызова
-        logger.debug(f"Calling Gemini Vision via to_thread with timeout={request_opts['timeout']}s...")
-        response = await asyncio.to_thread(
-            gemini_model.generate_content, 
-            contents, 
-            generation_config=gen_config, 
-            safety_settings=safety, 
-            request_options=request_opts
-        )
-        logger.debug(f"Received response object from Gemini Vision: {type(response)}") # Логируем тип ответа
-
+        response = await asyncio.to_thread(gemini_model.generate_content, contents, generation_config=gen_config, safety_settings=safety)
         # ... (обработка ответа как в generate_content_sync) ...
         resp_text = ""
-        # Добавим проверку наличия атрибутов перед доступом
-        if hasattr(response, 'text') and response.text:
-            resp_text = response.text
-        elif hasattr(response, 'candidates') and response.candidates and \
-             hasattr(response.candidates[0],'content') and response.candidates[0].content and \
-             hasattr(response.candidates[0].content,'parts') and response.candidates[0].content.parts:
-            resp_text = "".join(p.text for p in response.candidates[0].content.parts if hasattr(p,'text'))
-        else:
-            logger.warning(f"Could not extract text from Gemini Vision response. Response object: {response}")
+        if hasattr(response, 'text') and response.text: resp_text = response.text
+        elif response.candidates and hasattr(response.candidates[0],'content') and response.candidates[0].content.parts: resp_text = "".join(p.text for p in response.candidates[0].content.parts if hasattr(p,'text'))
 
         if not resp_text: # Проверка блокировки/ошибки
-            block_reason = None
-            finish_reason = None
-            if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason'):
-                block_reason = response.prompt_feedback.block_reason
-            if hasattr(response, 'candidates') and response.candidates and hasattr(response.candidates[0], 'finish_reason'):
-                finish_reason = response.candidates[0].finish_reason
-
-            if block_reason:
-                logger.warning(f"Gemini Vision response blocked: {block_reason}")
-                return f"[Ответ на изображение заблокирован: {block_reason}]"
-            elif finish_reason != 'STOP':
-                logger.warning(f"Gemini Vision response interrupted: {finish_reason}")
-                return f"[Ответ на изображение прерван: {finish_reason}]"
-            else:
-                 logger.warning(f"Gemini vision empty response. Full response: {response}")
-                 return "[Не удалось получить описание изображения]"
+            if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason: return f"[Ответ на изображение заблокирован: {response.prompt_feedback.block_reason}]"
+            elif response.candidates and response.candidates[0].finish_reason != 'STOP': return f"[Ответ на изображение прерван: {response.candidates[0].finish_reason}]"
+            else: logger.warning(f"Gemini vision empty response: {response}"); return "[Не удалось получить описание изображения]"
         return resp_text
-    except asyncio.TimeoutError: # Явно ловим TimeoutError, если to_thread его пробрасывает
-        logger.error("Gemini Vision request timed out.")
-        return "[Ошибка: Время ожидания ответа на изображение истекло]"
-    except Exception as e:
-        logger.error(f"Gemini Vision error: {type(e).__name__} - {e}", exc_info=True)
-        # Логируем полный ответ, если он есть в исключении
-        if hasattr(e, 'response'): logger.error(f"Error response data: {e.response}")
-        return f"[Ошибка анализа изображения: {type(e).__name__}]"
+    except Exception as e: logger.error(f"Gemini Vision error: {e}", exc_info=True); return "[Ошибка анализа изображения]"
 
 # --- Фильтрация ответа (без изменений) ---
 def filter_response(response: str) -> str:
@@ -383,3 +381,213 @@ def should_process_message() -> bool:
     if bot_activity_percentage >= 100: return True
     if bot_activity_percentage <= 0: return False
     return random.randint(1, 100) <= bot_activity_percentage
+
+class LoadBalancer:
+    def __init__(self):
+        self.providers = []
+        self.current_index = 0
+        
+    def update_providers(self):
+        from config import settings
+        self.providers = [
+            p for p in [
+                'gemini', 'mistral', 'openai', 
+                'groq', 'together', 'ollama'
+            ] if p in settings.AVAILABLE_PROVIDERS
+        ]
+    
+    def get_next_provider(self) -> str:
+        if not self.providers:
+            raise ValueError("No available providers")
+        
+        provider = self.providers[self.current_index]
+        self.current_index = (self.current_index + 1) % len(self.providers)
+        return provider
+
+load_balancer = LoadBalancer()
+
+async def load_balanced_generate(prompt: str) -> str:
+    load_balancer.update_providers()
+    for _ in range(len(load_balancer.providers)):
+        provider_name = load_balancer.get_next_provider()
+        try:
+            provider = get_llm_provider()
+            return await provider.generate_text_async(prompt)
+        except Exception as e:
+            logger.warning(f"Failed with {provider_name}: {e}")
+    return "Все провайдеры недоступны"
+
+class PerformanceMetrics:
+    def __init__(self):
+        self.timings = defaultdict(list)
+        self.error_counts = defaultdict(int)
+    
+    def log_time(self, provider: str, duration: float):
+        self.timings[provider].append(duration)
+    
+    def log_error(self, provider: str):
+        self.error_counts[provider] += 1
+    
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "average_times": {
+                p: sum(t)/len(t) for p, t in self.timings.items()
+            },
+            "error_counts": dict(self.error_counts)
+        }
+
+    def log_to_db(self):
+        """Сохраняет метрики в БД"""
+        try:
+            from state import get_db_connection
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            timestamp = time.time()
+            
+            for provider, times in self.timings.items():
+                avg_time = sum(times)/len(times) if times else 0
+                cursor.execute("""
+                    INSERT INTO provider_metrics 
+                    (provider, avg_time, error_count, timestamp)
+                    VALUES (?, ?, ?, ?)
+                """, (provider, avg_time, self.error_counts.get(provider,0), timestamp))
+            
+            conn.commit()
+            logger.info("Saved provider metrics to DB")
+        except Exception as e:
+            logger.error(f"Failed to save metrics: {e}")
+
+metrics = PerformanceMetrics()
+
+async def generate_with_metrics(prompt: str) -> str:
+    provider = get_llm_provider()
+    start_time = time.time()
+    try:
+        result = await provider.generate_text_async(prompt)
+        metrics.log_time(provider.name, time.time() - start_time)
+        return result
+    except Exception as e:
+        metrics.log_error(provider.name)
+        raise e
+
+class AutoFailover:
+    def __init__(self):
+        self.current_provider = settings.LLM_PROVIDER
+        self.error_count = 0
+        self.max_errors = 3
+        
+    def reset(self):
+        self.error_count = 0
+        self.current_provider = settings.LLM_PROVIDER
+        
+    def should_switch(self):
+        return self.error_count >= self.max_errors
+        
+    def switch_provider(self):
+        providers = settings.AVAILABLE_PROVIDERS
+        current_index = providers.index(self.current_provider)
+        new_index = (current_index + 1) % len(providers)
+        self.current_provider = providers[new_index]
+        self.error_count = 0
+        logger.info(f"Auto-switched to provider: {self.current_provider}")
+
+auto_failover = AutoFailover()
+
+async def generate_with_failover(prompt: str) -> str:
+    try:
+        provider = get_llm_provider()
+        response = await provider.generate_text_async(prompt)
+        auto_failover.reset()
+        return response
+    except Exception as e:
+        auto_failover.error_count += 1
+        logger.warning(f"Error with {provider.name} (count: {auto_failover.error_count})")
+        if auto_failover.should_switch():
+            auto_failover.switch_provider()
+        raise e
+
+class ResponseCache:
+    def __init__(self, max_size=1000):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+        self.hits = 0
+        self.misses = 0
+        
+    def get_key(self, prompt: str) -> str:
+        return hashlib.sha256(prompt.encode()).hexdigest()
+        
+    def get(self, prompt: str) -> Optional[str]:
+        key = self.get_key(prompt)
+        result = self.cache.get(key)
+        if result:
+            self.hits += 1
+        else:
+            self.misses += 1
+        return result
+        
+    def set(self, prompt: str, response: str):
+        key = self.get_key(prompt)
+        self.cache[key] = response
+        if len(self.cache) > self.max_size:
+            self.cache.popitem(last=False)
+            
+    def clear(self):
+        self.cache.clear()
+        logger.info(f"Cache cleared. Stats before reset: hits={self.hits}, misses={self.misses}")
+        self.hits = 0
+        self.misses = 0
+
+cache = ResponseCache()
+
+async def generate_with_cache(prompt: str) -> str:
+    cached = cache.get(prompt)
+    if cached:
+        logger.debug("Cache hit")
+        return cached
+        
+    response = await generate_with_failover(prompt)
+    cache.set(prompt, response)
+    return response
+
+async def metrics_job(context):
+    """Периодическое сохранение метрик"""
+    from state import get_db_connection
+    try:
+        metrics.log_to_db()
+        logger.debug("Provider metrics saved")
+    except Exception as e:
+        logger.error(f"Error in metrics job: {e}")
+
+async def generate_with_fallback(prompt: str, retries: int = 2) -> str:
+    providers_order = [
+        settings.LLM_PROVIDER,
+        'gemini',
+        'openai',
+        'mistral',
+        'groq',
+        'together',
+        'ollama'
+    ]
+    
+    last_error = None
+    for provider_name in providers_order[:retries+1]:
+        try:
+            # Сохраняем текущего провайдера
+            original_provider = settings.LLM_PROVIDER
+            # Временно меняем провайдера
+            settings.LLM_PROVIDER = provider_name
+            provider = get_llm_provider()
+            start_time = time.time()
+            response = await provider.generate_text_async(prompt)
+            logger.info(f"Generated with {provider.name} in {time.time()-start_time:.2f}s")
+            # Восстанавливаем оригинального провайдера
+            settings.LLM_PROVIDER = original_provider
+            return response
+        except Exception as e:
+            last_error = f"{provider_name}: {str(e)}"
+            logger.error(f"Error with {provider_name}: {e}")
+            continue
+    
+    # Восстанавливаем оригинального провайдера
+    settings.LLM_PROVIDER = providers_order[0]
+    return f"Ошибка генерации. Последняя ошибка: {last_error}"

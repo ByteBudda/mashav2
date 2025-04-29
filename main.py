@@ -5,6 +5,7 @@ from datetime import timedelta
 import signal
 import json # Для парсинга JSON из БД
 import random
+import time
 
 from telegram import Update
 from telegram.ext import (ApplicationBuilder, CallbackContext, CallbackQueryHandler,
@@ -18,7 +19,7 @@ from config import (ADMIN_USER_IDS, TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, MISTRAL_
 from state import load_all_data, save_all_data, cleanup_history_job, fact_extraction_job, _get_recent_active_group_chat_ids_sync, _get_recent_messages_sync, add_to_memory_history, save_message_and_embed
 
 # --- Импорт утилит ---
-from utils import cleanup_audio_files_job, generate_content_sync, filter_response
+from utils import cleanup_audio_files_job, generate_content_sync, filter_response, metrics_job
 
 # --- Импорт обработчиков и команд ---
 from bot_commands import (
@@ -29,9 +30,10 @@ from bot_commands import (
     reset_group_user_style_command, set_group_style_command, reset_group_style_command,
     ban_user_command, unban_user_command, list_banned_command, list_admins_command,
     get_log_command, error_handler,
-    get_gen_params_command, set_gen_params_command # Добавили команды управления параметрами Gemini
+    get_gen_params_command, set_gen_params_command, # Добавили команды управления параметрами Gemini
+    list_providers_command, switch_provider_command, provider_stats_command, clear_cache_command, cache_stats_command
 )
-from handlers import handle_message, handle_photo
+from handlers import handle_message, handle_photo, handle_document
 
 
 # --- Настройка обработчиков ---
@@ -47,12 +49,12 @@ def setup_handlers(application: Application):
     # Обработчики сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND | filters.VOICE | filters.VIDEO_NOTE, handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document)) # Ловит все документы
     # Обработчик колбэков
     application.add_handler(CallbackQueryHandler(button_callback, pattern='^(confirm_clear_my_history_|cancel_clear)'))
 
     # Административные команды
-    admin_filter = filters.User(user_id=ADMIN_USER_IDS) if ADMIN_USER_IDS else filters.UpdateFilter(lambda: False)
+    admin_filter = filters.User(user_id=ADMIN_USER_IDS) if ADMIN_USER_IDS else filters.UpdateFilter(lambda _: False)
     admin_commands = {
         "clear_history": clear_history_command, "get_log": get_log_command, "list_admins": list_admins_command,
         "set_default_style": set_default_style_command, "reset_style": reset_style_command,
@@ -60,7 +62,12 @@ def setup_handlers(application: Application):
         "reset_group_style": reset_group_style_command, "set_group_user_style": set_group_user_style_command,
         "reset_group_user_style": reset_group_user_style_command, "ban": ban_user_command,
         "unban": unban_user_command, "list_banned": list_banned_command, "set_activity": set_activity_command,
-        "get_gen_params": get_gen_params_command, "set_gen_params": set_gen_params_command # Добавили новые команды
+        "get_gen_params": get_gen_params_command, "set_gen_params": set_gen_params_command, # Добавили новые команды
+        "list_providers": list_providers_command,
+        "switch_provider": switch_provider_command,
+        "provider_stats": provider_stats_command,
+        "clear_cache": clear_cache_command,
+        "cache_stats": cache_stats_command
     }
     for command, handler in admin_commands.items():
         application.add_handler(CommandHandler(command, handler, filters=admin_filter))
@@ -94,13 +101,15 @@ def setup_jobs(application: Application):
     if settings.ENABLE_RANDOM_MESSAGES:
         jq.run_repeating(
             send_random_message_job, 
-            interval=timedelta(hours=settings.RANDOM_MESSAGE_INTERVAL_HOURS),
+            interval=timedelta(minutes=settings.RANDOM_MESSAGE_INTERVAL_MINUTES),
             first=timedelta(minutes=20), # Немного позже других задач
             name="send_random_message"
         )
-        logger.info(f"Random message job registered to run every {settings.RANDOM_MESSAGE_INTERVAL_HOURS} hours.")
+        logger.info(f"Random message job registered to run every {settings.RANDOM_MESSAGE_INTERVAL_MINUTES} minutes.")
     else:
         logger.info("Random message job is disabled.")
+
+    jq.run_repeating(metrics_job, interval=timedelta(minutes=5), first=10)
 
     logger.info("All background jobs registered.")
 
@@ -113,6 +122,9 @@ async def send_random_message_job(context: CallbackContext):
         return
 
     logger.info("Starting random message job...")
+    now = time.time()
+    min_inactivity_seconds = settings.RANDOM_MESSAGE_MIN_INACTIVITY_MINUTES * 60
+
     try:
         # Получаем список активных групповых чатов (синхронная функция в to_thread)
         active_group_ids = await asyncio.to_thread(_get_recent_active_group_chat_ids_sync)
@@ -120,19 +132,42 @@ async def send_random_message_job(context: CallbackContext):
             logger.info("Random message job: No active group chats found.")
             return
 
-        # Выбираем случайный чат
-        selected_chat_id = random.choice(active_group_ids)
+        # --- Фильтруем чаты по времени последней активности ---
+        suitable_chat_ids = []
+        for chat_id in active_group_ids:
+            # Получаем только последнее сообщение, чтобы проверить время
+            last_message_data = await asyncio.to_thread(_get_recent_messages_sync, chat_id, limit=1)
+            if last_message_data:
+                # Извлекаем timestamp из кортежа
+                _, _, _, last_ts = last_message_data[0]
+                if now - last_ts > min_inactivity_seconds:
+                    suitable_chat_ids.append(chat_id)
+                    logger.debug(f"Chat {chat_id} is suitable (last message > {settings.RANDOM_MESSAGE_MIN_INACTIVITY_MINUTES} min ago).")
+                else:
+                    logger.debug(f"Chat {chat_id} is too active (last message <= {settings.RANDOM_MESSAGE_MIN_INACTIVITY_MINUTES} min ago).")
+            else:
+                logger.debug(f"Could not get last message for chat {chat_id} to check activity.")
+
+        if not suitable_chat_ids:
+            logger.info(f"Random message job: No suitable inactive group chats found (min inactivity: {settings.RANDOM_MESSAGE_MIN_INACTIVITY_MINUTES} min).")
+            return
+
+        # Выбираем случайный чат из подходящих
+        selected_chat_id = random.choice(suitable_chat_ids)
         logger.info(f"Random message job: Selected chat ID {selected_chat_id}")
 
         # Получаем недавнюю историю для контекста (синхронная функция в to_thread)
-        recent_messages = await asyncio.to_thread(
+        # Теперь _get_recent_messages_sync возвращает и timestamp, но нам он здесь не нужен
+        recent_messages_with_ts = await asyncio.to_thread(
             _get_recent_messages_sync,
             history_key=selected_chat_id,
             limit=settings.RANDOM_MESSAGE_HISTORY_CONTEXT_COUNT
         )
+        # Отбрасываем timestamp для формирования контекста промпта
+        recent_messages = [(role, name, msg) for role, name, msg, _ in recent_messages_with_ts]
 
         if not recent_messages:
-            logger.warning(f"Random message job: No recent history found for chat {selected_chat_id}, skipping.")
+            logger.warning(f"Random message job: No recent history found for selected chat {selected_chat_id}, skipping.")
             return
 
         # Формируем контекст для промпта
@@ -141,17 +176,29 @@ async def send_random_message_job(context: CallbackContext):
             for role, name, msg in recent_messages
         )
 
-        # Формируем промпт
-        prompt = (
-            f"Ты - {settings.BOT_NAME}, общаешься в групповом чате. "
-            f"Недавно в чате обсуждали следующее:\n--- НАЧАЛО КОНТЕКСТА ---\n{history_context}\n--- КОНЕЦ КОНТЕКСТА ---\n"
-            f"Напиши КОРОТКОЕ (одно-два предложения) сообщение от своего лица ({settings.BOT_NAME}), "
-            f"чтобы поддержать беседу, задать релевантный вопрос или просто поделиться интересной мыслью, связанной с контекстом. "
-            f"Не надо здороваться или представляться. Будь естественной."
-            f"\n\n{settings.BOT_NAME}:"
-        )
+        # --- Выбор случайного типа промпта ---
+        prompt_styles = [
+            "чтобы поддержать беседу, задать релевантный вопрос или просто поделиться интересной мыслью, связанной с контекстом.",
+            "чтобы задать открытый вопрос, связанный с последними обсуждавшимися темами.",
+            "чтобы поделиться коротким наблюдением или фактом, который может быть интересен участникам чата, учитывая контекст.",
+            "чтобы предложить идею или тему для обсуждения, отталкиваясь от недавнего диалога.",
+            "чтобы вспомнить что-то забавное или интересное из предыдущего обсуждения (если было)."
+        ]
+        selected_style = random.choice(prompt_styles)
 
-        logger.debug(f"Random message job: Sending prompt for chat {selected_chat_id} (context: {len(recent_messages)} msgs)")
+        # Формируем промпт с использованием одной многострочной f-строки
+        prompt = f"""Ты - {settings.BOT_NAME}, участник группового чата. Твоя задача - инициировать общение или поддержать его, пока в чате затишье. \
+Недавний контекст общения:
+--- НАЧАЛО КОНТЕКСТА ---
+{history_context}
+--- КОНЕЦ КОНТЕКСТА ---
+Напиши ОЧЕНЬ КОРОТКОЕ (1-2 предложения максимум) сообщение от своего лица ({settings.BOT_NAME}), \
+{selected_style} \
+Не надо здороваться, представляться или извиняться за молчание. Просто напиши сообщение по делу. Будь естественной и дружелюбной.
+
+{settings.BOT_NAME}:"""
+
+        logger.debug(f"Random message job: Sending prompt for chat {selected_chat_id} (context: {len(recent_messages)} msgs, style: '{selected_style[:30]}...')")
         # Генерируем сообщение (синхронная функция в to_thread)
         generated_message = await asyncio.to_thread(generate_content_sync, prompt)
         filtered_message = filter_response(generated_message)

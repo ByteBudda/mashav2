@@ -5,6 +5,7 @@ import time
 from typing import List, Dict, Optional, Tuple, Any
 import threading
 import asyncio # Для блокировки кэша
+import re
 
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -30,18 +31,34 @@ def initialize_vector_db():
     if client and model: logger.info("Vector DB already initialized."); return
 
     logger.info(f"Initializing Vector DB (Chroma)... Path: {CHROMA_DB_PATH}")
-    logger.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME}...")
+    logger.info(f"Loading embedding model: {settings.EMBEDDING_MODEL}")
+
+    # Конфигурация для разных режимов
+    # Параметры HNSW теперь передаются в метаданные коллекции, а не в настройки клиента.
+    # Удаляем их из chroma_config, который используется для настроек клиента.
+    chroma_config_client = {
+        # 'perf': {'hnsw:ef_construction': 32, 'hnsw:ef': 32, 'hnsw:M': 8},
+        # 'balanced': {'hnsw:ef_construction': 64, 'hnsw:ef': 64, 'hnsw:M': 16},
+        # 'quality': {'hnsw:ef_construction': 128, 'hnsw:ef': 256, 'hnsw:M': 32}
+    }.get(settings.CHROMA_MODE, {})
+
     try:
         with model_lock:
             if model is None:
                 # Исправляем возможный race condition при многопоточной инициализации
                 if model is None:
-                    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+                    model = SentenceTransformer(settings.EMBEDDING_MODEL)
                     dimension = model.get_sentence_embedding_dimension()
-                    logger.info(f"Model '{EMBEDDING_MODEL_NAME}' loaded. Dimension: {dimension}")
+                    logger.info(f"Model '{settings.EMBEDDING_MODEL}' loaded. Dimension: {dimension}")
 
         # Инициализация клиента ChromaDB
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+        client = chromadb.PersistentClient(
+            path=CHROMA_DB_PATH,
+            # Передаем только те настройки, которые принимает PersistentClient
+            # settings=chromadb.Settings(**chroma_config_client) # Возможно, settings тут вообще не нужны для PersistentClient
+            # Используем пустые настройки, если нет специфичных для клиента
+            settings=chromadb.Settings()
+        )
         logger.info(f"ChromaDB client initialized. Path: {CHROMA_DB_PATH}")
 
         # Проверяем/создаем коллекцию фактов при инициализации (синхронно)
@@ -64,10 +81,18 @@ async def get_or_create_collection(name: str) -> Optional[chromadb.Collection]:
 
     # Если в кэше нет, пытаемся получить/создать
     try:
+        # Определяем метаданные HNSW в зависимости от режима
+        hnsw_metadata = {
+            'perf': {'hnsw:construction_ef': 32, 'hnsw:search_ef': 32, 'hnsw:M': 8, "hnsw:space": "cosine"},
+            'balanced': {'hnsw:construction_ef': 64, 'hnsw:search_ef': 64, 'hnsw:M': 16, "hnsw:space": "cosine"},
+            'quality': {'hnsw:construction_ef': 128, 'hnsw:search_ef': 256, 'hnsw:M': 32, "hnsw:space": "cosine"}
+        }.get(settings.CHROMA_MODE, {"hnsw:space": "cosine"}) # По умолчанию используем cosine, если режим неизвестен
+
         # Используем get_or_create_collection для атомарности
         collection = client.get_or_create_collection(
             name=name,
-            metadata={"hnsw:space": "cosine"} # Рекомендуется для эмбеддингов SBERT
+            # Передаем HNSW параметры в metadata
+            metadata=hnsw_metadata
         )
         logger.info(f"Accessed/Created ChromaDB collection '{name}'. Count: {collection.count()}")
         # Обновляем кэш после успешного получения/создания
@@ -85,9 +110,17 @@ def get_or_create_facts_collection_sync() -> Optional[chromadb.Collection]:
     if not client: return None
     name = CHROMA_FACTS_COLLECTION_NAME
     try:
+        # Определяем метаданные HNSW для коллекции фактов (можно использовать те же режимы или свои)
+        hnsw_metadata = {
+            'perf': {'hnsw:construction_ef': 32, 'hnsw:search_ef': 32, 'hnsw:M': 8, "hnsw:space": "cosine"},
+            'balanced': {'hnsw:construction_ef': 64, 'hnsw:search_ef': 64, 'hnsw:M': 16, "hnsw:space": "cosine"},
+            'quality': {'hnsw:construction_ef': 128, 'hnsw:search_ef': 256, 'hnsw:M': 32, "hnsw:space": "cosine"}
+        }.get(settings.CHROMA_MODE, {"hnsw:space": "cosine"})
+
         collection = client.get_or_create_collection(
             name=name,
-            metadata={"hnsw:space": "cosine"}
+            # Передаем HNSW параметры в metadata
+            metadata=hnsw_metadata
         )
         logger.info(f"Accessed/Created ChromaDB facts collection '{name}'. Count: {collection.count()}")
         # Добавляем в кэш (здесь можно без async lock, т.к. вызывается при старте)
@@ -101,6 +134,15 @@ def get_history_collection_name(history_key: int) -> str:
     """Генерирует имя коллекции для истории чата."""
     # Используем префикс и ключ, проверяем на допустимые символы (Chroma требует特定формат)
     safe_key = str(history_key).replace('-', '_neg_') # Заменяем минус, если chat_id отрицательный
+    # Проверяем на недопустимые символы и обрезаем, если нужно
+    safe_key = re.sub(r'[^a-zA-Z0-9_-]', '_', safe_key) # Заменяем все, кроме a-z, A-Z, 0-9, _, - на _
+    # ChromaDB collection names must start and end with an alphanumeric character
+    safe_key = re.sub(r'^[^a-zA-Z0-9]+', '', safe_key)
+    safe_key = re.sub(r'[^a-zA-Z0-9]+$', '', safe_key)
+    # Убедимся, что имя не пустое после очистки
+    if not safe_key:
+        safe_key = f"key_{abs(history_key)}" # Fallback если все символы недопустимы
+
     return f"{CHROMA_HISTORY_COLLECTION_PREFIX}{safe_key}"
 
 async def get_history_collection(history_key: int) -> Optional[chromadb.Collection]:
@@ -120,7 +162,8 @@ def add_message_embedding_sync(sqlite_id: int, history_key: int, role: str, text
     # Это может быть неоптимально, если много потоков будут создавать коллекции одновременно
     # Лучше передавать объект коллекции или использовать асинхронный вариант
     collection_name = get_history_collection_name(history_key)
-    collection = asyncio.run(get_or_create_collection(collection_name)) # Запускаем async в sync контексте
+    # Используем асинхронную функцию get_or_create_collection через asyncio.run
+    collection = asyncio.run(get_or_create_collection(collection_name))
 
     if collection is None:
         logger.error(f"Sync: Could not get history collection '{collection_name}'. Skipping embedding.")
@@ -143,7 +186,8 @@ def add_fact_embedding_sync(fact_id: str, history_key: int, fact_type: str, fact
     if model is None: return
     if not fact_text or not fact_text.strip(): return
 
-    facts_collection = asyncio.run(get_or_create_collection(CHROMA_FACTS_COLLECTION_NAME)) # Запускаем async в sync
+    # Используем асинхронную функцию get_or_create_collection через asyncio.run
+    facts_collection = asyncio.run(get_or_create_collection(CHROMA_FACTS_COLLECTION_NAME))
     if facts_collection is None:
         logger.error("Sync: Could not get facts collection. Skipping fact embedding.")
         return
@@ -166,7 +210,8 @@ def search_relevant_history_sync(history_key: int, query_text: str, k: int = VEC
     if model is None: return results
     if not query_text or not query_text.strip(): return results
 
-    collection = asyncio.run(get_history_collection(history_key)) # Запускаем async в sync
+    # Используем асинхронную функцию get_history_collection через asyncio.run
+    collection = asyncio.run(get_history_collection(history_key))
     if collection is None: return results
 
     try:
@@ -193,14 +238,15 @@ def search_relevant_history_sync(history_key: int, query_text: str, k: int = VEC
     return results
 
 
-def search_relevant_facts_sync(history_key: int, query_text: str, k: int = VECTOR_SEARCH_K_FACTS) -> List[Tuple[str, Dict[str, Any]]]:
+def search_relevant_facts_sync(history_key: int, query_text: str, k: int = VECTOR_SEARCH_K_FACTS) -> List[Tuple[str, Dict[str, Any], float]]:
     """Синхронная функция поиска релевантных фактов (для to_thread)."""
     global model
     results = []
     if model is None: return results
     if not query_text or not query_text.strip(): return results
 
-    facts_collection = asyncio.run(get_or_create_collection(CHROMA_FACTS_COLLECTION_NAME)) # Запускаем async в sync
+    # Используем асинхронную функцию get_or_create_collection через asyncio.run
+    facts_collection = asyncio.run(get_or_create_collection(CHROMA_FACTS_COLLECTION_NAME))
     if facts_collection is None: return results
 
     try:
@@ -216,7 +262,7 @@ def search_relevant_facts_sync(history_key: int, query_text: str, k: int = VECTO
             include=['documents', 'metadatas', 'distances'] # Запрашиваем distance
         )
         if query_results and query_results.get('ids') and query_results['ids'][0]:
-            num_found = len(query_results['ids'][0]); logger.info(...)
+            num_found = len(query_results['ids'][0]); logger.info(f"Sync: Found {num_found} relevant facts for key {history_key}.")
             docs = query_results['documents'][0] if query_results.get('documents') else []
             metadatas = query_results['metadatas'][0] if query_results.get('metadatas') else []
             distances = query_results['distances'][0] if query_results.get('distances') else [] # Получаем расстояния
@@ -237,7 +283,8 @@ def delete_embeddings_by_sqlite_ids_sync(history_key: int, sqlite_ids: List[int]
     """Синхронная функция удаления эмбеддингов истории (для to_thread)."""
     if not sqlite_ids: return
 
-    collection = asyncio.run(get_history_collection(history_key)) # Запускаем async в sync
+    # Используем асинхронную функцию get_history_collection через asyncio.run
+    collection = asyncio.run(get_history_collection(history_key))
     if collection is None: logger.warning(f"Sync: Cannot delete embeddings: collection for key {history_key} not found."); return
 
     chroma_ids_to_delete = [str(sid) for sid in sqlite_ids]
@@ -252,7 +299,8 @@ def delete_fact_embeddings_by_ids_sync(fact_ids: List[str]):
     """Синхронная функция удаления эмбеддингов фактов по их ID (для to_thread)."""
     if not fact_ids: return
 
-    facts_collection = asyncio.run(get_or_create_collection(CHROMA_FACTS_COLLECTION_NAME)) # Запускаем async в sync
+    # Используем асинхронную функцию get_or_create_collection через asyncio.run
+    facts_collection = asyncio.run(get_or_create_collection(CHROMA_FACTS_COLLECTION_NAME))
     if facts_collection is None: logger.warning("Sync: Cannot delete fact embeddings: facts collection not found."); return
 
     logger.info(f"Sync: Attempting to delete {len(fact_ids)} fact embeddings from '{facts_collection.name}'...")
@@ -264,7 +312,8 @@ def delete_fact_embeddings_by_ids_sync(fact_ids: List[str]):
 
 def delete_facts_by_history_key_sync(history_key: int):
     """Синхронная функция удаления ВСЕХ фактов для history_key (для to_thread)."""
-    facts_collection = asyncio.run(get_or_create_collection(CHROMA_FACTS_COLLECTION_NAME)) # Запускаем async в sync
+    # Используем асинхронную функцию get_or_create_collection через asyncio.run
+    facts_collection = asyncio.run(get_or_create_collection(CHROMA_FACTS_COLLECTION_NAME))
     if facts_collection is None: return
     logger.info(f"Sync: Attempting to delete ALL facts for history_key {history_key}...")
     try:
