@@ -46,25 +46,42 @@ prompt_builder = PromptBuilder(settings)
 
 # --- Константа для лимита текста из документа ---
 MAX_DOCUMENT_TEXT_LENGTH = 5000 # Ограничение символов для LLM
+def split_message(text: str, max_length: int = 4096) -> List[str]:
+    """Разбивает текст на части, чтобы каждая часть была не длиннее max_length."""
+    if len(text) <= max_length:
+        return [text]
 
+    parts = []
+    while len(text) > max_length:
+        # Ищем последний перенос строки или пробел перед лимитом
+        split_index = text.rfind('\n', 0, max_length)
+        if split_index == -1:
+            split_index = text.rfind(' ', 0, max_length)
+        if split_index == -1:
+            split_index = max_length  # Если нет пробелов или переносов, режем по лимиту
+
+        parts.append(text[:split_index].strip())
+        text = text[split_index:].strip()
+
+    if text:
+        parts.append(text)
+
+    return parts
 # --- Внутренняя функция _process_generation_and_reply ---
 async def _process_generation_and_reply(
     update: Update, context: ContextTypes.DEFAULT_TYPE, history_key: int,
     prompt: str, user_message_text: str, # Оригинальный текст пользователя
     reply_to_message_id_override: Optional[int] = None # Для ответов на сообщения
 ):
-    """
-    Генерирует ответ, отправляет его, сохраняет сообщения пользователя и бота в БД/индекс.
-    """
     chat_id = update.effective_chat.id
     user = update.effective_user
-    if not user: return
+    if not user:
+        return
 
     user_name = await asyncio.to_thread(get_user_preferred_name_from_db, user.id) or user.first_name or f"User_{user.id}"
     display_user_name = user_name if update.effective_chat.type != 'private' else None
 
     # --- Сохранение сообщения пользователя и эмбеддинг ---
-    # Сохраняем оригинальный текст пользователя (или документа)
     await save_message_and_embed(history_key, USER_ROLE, user_message_text, display_user_name)
 
     await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
@@ -78,37 +95,46 @@ async def _process_generation_and_reply(
         logger.info(f"Filtered response for key {history_key}: {filtered[:100]}...")
     except Exception as e:
         logger.error(f"Generation error in _process_generation_and_reply: {e}", exc_info=True)
-        filtered = "[Произошла ошибка при генерации ответа]" # Устанавливаем текст ошибки
+        filtered = "[Произошла ошибка при генерации ответа]"  # Устанавливаем текст ошибки
 
     # Определяем на какое сообщение отвечать
-    reply_to_id = reply_to_message_id_override # Если передан ID (например, для /ask)
-    if reply_to_id is None and update.message: # Если ID не передан, используем ID сообщения пользователя (если есть)
+    reply_to_id = reply_to_message_id_override  # Если передан ID (например, для /ask)
+    if reply_to_id is None and update.message:  # Если ID не передан, используем ID сообщения пользователя (если есть)
         reply_to_id = update.message.message_id if update.effective_chat.type != 'private' else None
 
     if filtered and not filtered.startswith("["):
-        add_to_memory_history(history_key, ASSISTANT_ROLE, filtered) # Добавляем в память
+        add_to_memory_history(history_key, ASSISTANT_ROLE, filtered)  # Добавляем в память
         # --- Сохранение ответа бота и эмбеддинг ---
         await save_message_and_embed(history_key, ASSISTANT_ROLE, filtered)
         logger.debug(f"Sending response to chat {chat_id}")
+
+        # Разбиваем сообщение на части и отправляем их по очереди
+        message_parts = split_message(filtered)
+        for part in message_parts:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=part, reply_to_message_id=reply_to_id)
+            except Exception as e:
+                logger.error(f"Failed to send message part to {chat_id}: {e}")
+    elif filtered.startswith("["):  # Обработка ошибок генерации, переданных в строке
+        logger.warning(f"LLM issue for key {history_key}: {filtered}")
+        reply_text = "Извините, не могу сейчас ответить на это."
+        if "blocked" in filtered.lower():
+            reply_text = "Мой ответ был заблокирован системой безопасности."
+        elif "error" in filtered.lower() or "ошибка" in filtered.lower():
+            reply_text = "Произошла ошибка при генерации ответа."
+        elif filtered == "[Произошла ошибка при генерации ответа]":
+            reply_text = filtered  # Используем текст из except блока
         try:
-             await context.bot.send_message(chat_id=chat_id, text=filtered, reply_to_message_id=reply_to_id)
+            await context.bot.send_message(chat_id=chat_id, text=reply_text, reply_to_message_id=reply_to_id)
         except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
-
-    elif filtered.startswith("["): # Обработка ошибок генерации, переданных в строке
-         logger.warning(f"LLM issue for key {history_key}: {filtered}")
-         reply_text = "Извините, не могу сейчас ответить на это."
-         if "blocked" in filtered.lower(): reply_text = "Мой ответ был заблокирован системой безопасности."
-         elif "error" in filtered.lower() or "ошибка" in filtered.lower(): reply_text = "Произошла ошибка при генерации ответа."
-         elif filtered == "[Произошла ошибка при генерации ответа]": reply_text = filtered # Используем текст из except блока
-         try: await context.bot.send_message(chat_id=chat_id, text=reply_text, reply_to_message_id=reply_to_id)
-         except Exception as e: logger.error(f"Failed to send error message to {chat_id}: {e}")
-
-    else: # Пустой ответ
+            logger.error(f"Failed to send error message to {chat_id}: {e}")
+    else:  # Пустой ответ
         logger.warning(f"Empty filtered response for key {history_key}. Original Raw: {response[:100]}...")
         reply_text = "Простите, у меня возникли сложности с ответом."
-        try: await context.bot.send_message(chat_id=chat_id, text=reply_text, reply_to_message_id=reply_to_id)
-        except Exception as e: logger.error(f"Failed to send empty response message to {chat_id}: {e}")
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=reply_text, reply_to_message_id=reply_to_id)
+        except Exception as e:
+            logger.error(f"Failed to send empty response message to {chat_id}: {e}")
 
 # --- Объединенный обработчик для текста, голоса, видео ---
 async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -547,11 +573,4 @@ async def _process_photo_reply(update: Update, context: ContextTypes.DEFAULT_TYP
          # Попытка отправить сообщение об ошибке пользователю
          try: await context.bot.send_message(chat_id, "Произошла внутренняя ошибка при обработке фото.", reply_to_message_id=reply_to_message_id)
          except Exception: pass # Игнорируем ошибки отправки
-
-
-# --- Переназначение обработчиков ---
-# Оставляем универсальный для текста/голоса/видео
 handle_message = handle_text_voice_video
-# handle_voice_message = handle_text_voice_video # Можно удалить, т.к. handle_message ловит filter.VOICE
-# handle_video_note_message = handle_text_voice_video # Можно удалить, т.к. handle_message ловит filter.VIDEO_NOTE
-# Новый обработчик документов будет зарегистрирован отдельно в main.py

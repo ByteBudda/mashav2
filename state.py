@@ -27,8 +27,7 @@ from config import (logger, settings, DB_FILE, USER_ROLE, ASSISTANT_ROLE, SYSTEM
 # --- Импорт синхронных функций из vector_db ---
 from vector_db import (
     initialize_vector_db, add_message_embedding_sync, add_fact_embedding_sync,
-    delete_embeddings_by_sqlite_ids_sync, delete_fact_embeddings_by_ids_sync, # Реализовано в vector_db
-    delete_facts_by_history_key_sync
+    delete_embeddings_by_sqlite_ids_sync, delete_fact_embeddings_by_ids_sync,delete_facts_by_history_key_sync
 )
 
 # --- Глобальное состояние бота (в памяти) ---
