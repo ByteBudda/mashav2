@@ -10,3 +10,14 @@ chromadb
 sqlite-utils
 ffmpeg-python
 google-generativeai
+aiohttp
+asyncio
+chromadb
+docx
+mistralai
+openai
+PyPDF2
+reportlab
+requests
+together
+typing
