@@ -21,7 +21,7 @@ from config import logger, ADMIN_USER_IDS, settings, SYSTEM_ROLE, USER_ROLE, ASS
 from state import (
     add_to_memory_history, chat_history, last_activity, # In-memory state
     set_user_preferred_name_in_db, get_user_info_from_db, # User DB functions
-    bot_activity_percentage, save_bot_settings_to_db, # Bot state/settings
+    save_bot_settings_to_db, # Bot state/settings
     get_db_connection, _execute_db, # DB helpers
     set_group_user_style_in_db, delete_group_user_style_in_db, # User-group style DB
     set_group_style_in_db, delete_group_style_in_db, # Group style DB
@@ -630,7 +630,7 @@ async def set_bot_name_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if name:
         settings.update_bot_name(name) # Update in memory
         # Save to DB
-        await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), bot_activity_percentage)
+        await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), state.bot_activity_percentage)
         await msg.reply_text(f"✅ Имя бота изменено на *{escape_markdown_v2(settings.BOT_NAME)}* и сохранено\\.", parse_mode='MarkdownV2')
         logger.info(f"Admin {user.id} set bot name to '{settings.BOT_NAME}'.")
     else:
@@ -638,17 +638,17 @@ async def set_bot_name_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 @admin_only
 async def set_activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global bot_activity_percentage # Modify global var from state
+    import state
     msg = update.message; user = update.effective_user
     if not msg or not user: return
     if not context.args:
-        await msg.reply_text(f"Текущая активность в группах: *{bot_activity_percentage}%*\\. Чтобы изменить, укажите новую: `/set_activity <%>`", parse_mode='MarkdownV2'); return
+        await msg.reply_text(f"Текущая активность в группах: *{state.bot_activity_percentage}%*\\. Чтобы изменить, укажите новую: `/set_activity <%>`", parse_mode='MarkdownV2'); return
     try:
         percent = int(context.args[0])
         if 0 <= percent <= 100:
-            bot_activity_percentage = percent
+            state.bot_activity_percentage = percent
             # Save to DB
-            await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), bot_activity_percentage)
+            await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), state.bot_activity_percentage)
             await msg.reply_text(f"✅ Активность в группах установлена на *{percent}%* и сохранена\\.", parse_mode='MarkdownV2')
             logger.info(f"Admin {user.id} set activity to {percent}%")
         else:
@@ -751,7 +751,7 @@ async def set_gen_params_command(update: Update, context: ContextTypes.DEFAULT_T
 
     # Update settings in memory and save to DB
     settings.GEMINI_GENERATION_CONFIG = new_params
-    await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), bot_activity_percentage)
+    await asyncio.to_thread(save_bot_settings_to_db, settings.get_settings_dict(), state.bot_activity_percentage)
 
     # Report success
     try:

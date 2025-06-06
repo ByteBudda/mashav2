@@ -1,9 +1,24 @@
 # -*- coding: utf-8 -*-
-import together # Используем основной импорт
+import together
+import requests
+import aiohttp
 import asyncio
-from typing import Dict, Any, List # Добавили List
+from typing import Dict, Any, List, Optional
 import logging
 from .base import LLMProvider
+import asyncio
+import os
+import random
+from io import BytesIO
+import base64
+from PIL import Image
+from telegram import Update, constants
+from telegram.ext import ContextTypes
+
+
+
+
+
 
 logger = logging.getLogger("chatbot") # Используем ваш стандартный логгер
 
@@ -90,6 +105,66 @@ class TogetherProvider(LLMProvider):
         except Exception as e:
             logger.error(f"Error calling Together API (sync): {e}", exc_info=True)
             return f"[Ошибка API Together: {e}]"
+
+    async def generate_vision_async(self, image_bytes: bytes, prompt: str, caption: Optional[str] = None) -> str:
+        """
+        Асинхронно получает описание изображения через Llama Vision (Together API).
+        :param image_bytes: байты изображения
+        :param prompt: основной промпт для vision
+        :param caption: подпись пользователя (опционально)
+        :return: описание изображения (строка)
+        """
+        # --- Сжимаем и определяем mime-type ---
+        try:
+            with Image.open(BytesIO(image_bytes)) as img:
+                img_format = img.format or "JPEG"
+                mime_type = f"image/{img_format.lower()}"
+                img.thumbnail((768, 768))
+                buffer = BytesIO()
+                img.save(buffer, format="JPEG", quality=80)
+                compressed_image_bytes = buffer.getvalue()
+        except Exception:
+            compressed_image_bytes = image_bytes
+            mime_type = "image/jpeg"
+
+        image_base64 = base64.b64encode(compressed_image_bytes).decode('utf-8')
+
+        # --- Формируем prompt для vision ---
+        prompt_vision = prompt
+        if caption:
+            prompt_vision += f"\n\nТакже учти следующее описание к изображению: «{caption}»."
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt_vision},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_base64}"}}
+            ]
+        }]
+
+        try:
+            response = await asyncio.to_thread(
+                self.client.chat.completions.create,
+                model="meta-llama/Llama-Vision-Free",
+                messages=messages,
+                max_tokens=1024,
+            )
+            if response and response.choices and len(response.choices) > 0:
+                description_ru = response.choices[0].message.content.strip()
+                logger.debug(f"Llama Vision response: {description_ru[:60]}...")
+                return description_ru
+            else:
+                logger.warning(f"Empty or unexpected response from Llama Vision: {response}")
+                return "[Ошибка: Пустой ответ от Llama Vision]"
+        except Exception as e:
+            logger.error(f"Error calling Llama Vision: {e}", exc_info=True)
+            return f"[Ошибка Vision Together: {e}]"
+
+    async def generate_any_async(self, prompt: str, image_bytes: bytes = None, caption: str = None) -> str:
+        if image_bytes:
+            return await self.generate_vision_async(image_bytes, prompt, caption)
+        else:
+            return await self.generate_text_async(prompt)
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> 'TogetherProvider':

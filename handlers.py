@@ -12,6 +12,9 @@ from telegram import Update, constants
 from telegram.ext import ContextTypes
 import pydub
 from pydub import AudioSegment
+from together import Together
+import base64
+import state
 
 # --- Импорты для обработки документов ---
 from documents_handler import (
@@ -22,20 +25,25 @@ from documents_handler import (
 from bot_commands import escape_markdown_v2
 from config import (ASSISTANT_ROLE, SYSTEM_ROLE, USER_ROLE,
                     logger, settings, TEMP_MEDIA_DIR)
-# Импортируем функции работы с состоянием/БД
+# --- Импорт состояния и функций управления им ---
 from state import (
-    add_to_memory_history, chat_history, last_activity,
-    get_user_preferred_name_from_db, get_user_topic_from_db,
-    is_user_banned, save_message_and_embed, bot_activity_percentage,
-    extract_and_save_facts # Импортируем функцию извлечения фактов
+    load_all_data, save_all_data, cleanup_history_job, fact_extraction_job,
+    _get_recent_active_group_chat_ids_sync, _get_recent_messages_sync,
+    add_to_memory_history, save_message_and_embed,
+    is_user_banned,
+    get_user_preferred_name_from_db,
+    get_user_topic_from_db,
+    chat_history
 )
+
 # Импортируем утилиты
 from utils import (
-    filter_response, # generate_content_sync - убрали, т.к. есть обертки
+    filter_response,
     generate_vision_content_async,
     transcribe_voice, update_user_info,
     _get_effective_style, should_process_message, PromptBuilder,
-    generate_with_cache # ИСПОЛЬЗУЕМ ОБЕРТКУ ДЛЯ КЭША И МЕТРИК
+    generate_with_cache,
+    get_llm_provider
 )
 # --- Импорт функций поиска из vector_db ---
 # Используем синхронные версии для вызова через to_thread
@@ -43,45 +51,60 @@ from vector_db import search_relevant_history_sync, search_relevant_facts_sync
 
 # Создаем PromptBuilder
 prompt_builder = PromptBuilder(settings)
-
-# --- Константа для лимита текста из документа ---
-MAX_DOCUMENT_TEXT_LENGTH = 5000 # Ограничение символов для LLM
+# --- Вспомогательная функция для разбивки сообщений ---
 def split_message(text: str, max_length: int = 4096) -> List[str]:
-    """Разбивает текст на части, чтобы каждая часть была не длиннее max_length."""
+    """Разбивает текст на части, чтобы каждая часть была не длиннее max_length, стараясь резать по строкам/пробелам."""
     if len(text) <= max_length:
         return [text]
 
     parts = []
-    while len(text) > max_length:
-        # Ищем последний перенос строки или пробел перед лимитом
-        split_index = text.rfind('\n', 0, max_length)
-        if split_index == -1:
-            split_index = text.rfind(' ', 0, max_length)
-        if split_index == -1:
-            split_index = max_length  # Если нет пробелов или переносов, режем по лимиту
+    current_part = ""
+    lines = text.splitlines(keepends=True) # Разбиваем по строкам, сохраняя переносы
 
-        parts.append(text[:split_index].strip())
-        text = text[split_index:].strip()
+    for line in lines:
+        # Если добавление строки превысит лимит
+        if len(current_part) + len(line) > max_length:
+            # Если есть что добавить - добавляем
+            if current_part:
+                 parts.append(current_part.rstrip()) # Удаляем пробельные символы в конце
+                 current_part = ""
+            # Если сама строка длиннее лимита - режем ее грубо
+            while len(line) > max_length:
+                split_index = line.rfind(' ', 0, max_length) # Ищем пробел для разрыва
+                if split_index == -1: split_index = max_length # Режем по лимиту, если нет пробелов
+                parts.append(line[:split_index])
+                line = line[split_index:].lstrip() # Удаляем пробелы в начале следующей части
+            # Добавляем остаток строки (или всю строку, если она была короче лимита изначально)
+            current_part = line
+        else:
+             current_part += line # Добавляем строку к текущей части
 
-    if text:
-        parts.append(text)
+    if current_part: # Добавляем последнюю часть
+        parts.append(current_part.rstrip())
 
-    return parts
+    # Финальная проверка, чтобы убедиться, что нет пустых частей
+    return [p for p in parts if p]
+# --- Константа для лимита текста из документа ---
+MAX_DOCUMENT_TEXT_LENGTH = 5000 # Ограничение символов для LLM
+
 # --- Внутренняя функция _process_generation_and_reply ---
 async def _process_generation_and_reply(
     update: Update, context: ContextTypes.DEFAULT_TYPE, history_key: int,
     prompt: str, user_message_text: str, # Оригинальный текст пользователя
     reply_to_message_id_override: Optional[int] = None # Для ответов на сообщения
 ):
+    """
+    Генерирует ответ, отправляет его, сохраняет сообщения пользователя и бота в БД/индекс.
+    """
     chat_id = update.effective_chat.id
     user = update.effective_user
-    if not user:
-        return
+    if not user: return
 
     user_name = await asyncio.to_thread(get_user_preferred_name_from_db, user.id) or user.first_name or f"User_{user.id}"
     display_user_name = user_name if update.effective_chat.type != 'private' else None
 
     # --- Сохранение сообщения пользователя и эмбеддинг ---
+    # Сохраняем оригинальный текст пользователя (или документа)
     await save_message_and_embed(history_key, USER_ROLE, user_message_text, display_user_name)
 
     await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
@@ -95,46 +118,37 @@ async def _process_generation_and_reply(
         logger.info(f"Filtered response for key {history_key}: {filtered[:100]}...")
     except Exception as e:
         logger.error(f"Generation error in _process_generation_and_reply: {e}", exc_info=True)
-        filtered = "[Произошла ошибка при генерации ответа]"  # Устанавливаем текст ошибки
+        filtered = "[Произошла ошибка при генерации ответа]" # Устанавливаем текст ошибки
 
     # Определяем на какое сообщение отвечать
-    reply_to_id = reply_to_message_id_override  # Если передан ID (например, для /ask)
-    if reply_to_id is None and update.message:  # Если ID не передан, используем ID сообщения пользователя (если есть)
+    reply_to_id = reply_to_message_id_override # Если передан ID (например, для /ask)
+    if reply_to_id is None and update.message: # Если ID не передан, используем ID сообщения пользователя (если есть)
         reply_to_id = update.message.message_id if update.effective_chat.type != 'private' else None
 
     if filtered and not filtered.startswith("["):
-        add_to_memory_history(history_key, ASSISTANT_ROLE, filtered)  # Добавляем в память
+        add_to_memory_history(history_key, ASSISTANT_ROLE, filtered) # Добавляем в память
         # --- Сохранение ответа бота и эмбеддинг ---
         await save_message_and_embed(history_key, ASSISTANT_ROLE, filtered)
         logger.debug(f"Sending response to chat {chat_id}")
-
-        # Разбиваем сообщение на части и отправляем их по очереди
-        message_parts = split_message(filtered)
-        for part in message_parts:
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=part, reply_to_message_id=reply_to_id)
-            except Exception as e:
-                logger.error(f"Failed to send message part to {chat_id}: {e}")
-    elif filtered.startswith("["):  # Обработка ошибок генерации, переданных в строке
-        logger.warning(f"LLM issue for key {history_key}: {filtered}")
-        reply_text = "Извините, не могу сейчас ответить на это."
-        if "blocked" in filtered.lower():
-            reply_text = "Мой ответ был заблокирован системой безопасности."
-        elif "error" in filtered.lower() or "ошибка" in filtered.lower():
-            reply_text = "Произошла ошибка при генерации ответа."
-        elif filtered == "[Произошла ошибка при генерации ответа]":
-            reply_text = filtered  # Используем текст из except блока
         try:
-            await context.bot.send_message(chat_id=chat_id, text=reply_text, reply_to_message_id=reply_to_id)
+             await context.bot.send_message(chat_id=chat_id, text=filtered, reply_to_message_id=reply_to_id)
         except Exception as e:
-            logger.error(f"Failed to send error message to {chat_id}: {e}")
-    else:  # Пустой ответ
+            logger.error(f"Failed to send message to {chat_id}: {e}")
+
+    elif filtered.startswith("["): # Обработка ошибок генерации, переданных в строке
+         logger.warning(f"LLM issue for key {history_key}: {filtered}")
+         reply_text = "Извините, не могу сейчас ответить на это."
+         if "blocked" in filtered.lower(): reply_text = "Мой ответ был заблокирован системой безопасности."
+         elif "error" in filtered.lower() or "ошибка" in filtered.lower(): reply_text = "Произошла ошибка при генерации ответа."
+         elif filtered == "[Произошла ошибка при генерации ответа]": reply_text = filtered # Используем текст из except блока
+         try: await context.bot.send_message(chat_id=chat_id, text=reply_text, reply_to_message_id=reply_to_id)
+         except Exception as e: logger.error(f"Failed to send error message to {chat_id}: {e}")
+
+    else: # Пустой ответ
         logger.warning(f"Empty filtered response for key {history_key}. Original Raw: {response[:100]}...")
         reply_text = "Простите, у меня возникли сложности с ответом."
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=reply_text, reply_to_message_id=reply_to_id)
-        except Exception as e:
-            logger.error(f"Failed to send empty response message to {chat_id}: {e}")
+        try: await context.bot.send_message(chat_id=chat_id, text=reply_text, reply_to_message_id=reply_to_id)
+        except Exception as e: logger.error(f"Failed to send empty response message to {chat_id}: {e}")
 
 # --- Объединенный обработчик для текста, голоса, видео ---
 async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,29 +291,28 @@ async def handle_text_voice_video(update: Update, context: ContextTypes.DEFAULT_
 
     else: # Группа
         should_reply = False
-        activity_check_passed = should_process_message()
+        try:
+            bot_info = await context.bot.get_me()
+            bot_id = bot_info.id
+            bot_uname = bot_info.username
+        except Exception as e:
+            logger.error(f"Failed getting bot info: {e}")
+            bot_id = None
+            bot_uname = settings.BOT_NAME
 
-        if activity_check_passed:
-            if bot_activity_percentage == 100: # Всегда отвечаем при 100%
+        mentioned = (bot_uname and f"@{bot_uname}".lower() in prompt_input_text_for_llm.lower()) or \
+                    settings.BOT_NAME.lower() in prompt_input_text_for_llm.lower()
+        replied = update.message.reply_to_message and update.message.reply_to_message.from_user and update.message.reply_to_message.from_user.id == bot_id
+
+        if mentioned or replied:
+            should_reply = True
+            logger.info(f"Processing group {message_type} from {user_name} ({user_id}). Reason: Mention={mentioned}, Reply={replied} (Activity {state.bot_activity_percentage}%)")
+        else:
+            if should_process_message():
                 should_reply = True
-                logger.info(f"Processing group {message_type} from {user_name} ({user_id}). Reason: Activity 100%.")
-            else: # Проверяем упоминание/ответ при < 100%
-                try:
-                    bot_info = await context.bot.get_me(); bot_id = bot_info.id; bot_uname = bot_info.username
-                except Exception as e:
-                    logger.error(f"Failed getting bot info: {e}"); bot_id = None; bot_uname = settings.BOT_NAME
-
-                mentioned = (bot_uname and f"@{bot_uname}".lower() in prompt_input_text_for_llm.lower()) or \
-                            settings.BOT_NAME.lower() in prompt_input_text_for_llm.lower()
-                replied = update.message.reply_to_message and update.message.reply_to_message.from_user and update.message.reply_to_message.from_user.id == bot_id
-
-                if mentioned or replied:
-                    should_reply = True
-                    logger.info(f"Processing group {message_type} from {user_name} ({user_id}). Reason: Mention={mentioned}, Reply={replied} (Activity {bot_activity_percentage}%)")
-                else:
-                    logger.info(f"Ignoring group {message_type} from {user_name} ({user_id}) (no mention/reply, Activity {bot_activity_percentage}% pass).")
-        else: # Не прошли проверку активности (< 100%)
-            logger.debug(f"Skipping group msg from {user_id} due to activity check fail ({bot_activity_percentage}%).")
+                logger.info(f"Processing group {message_type} from {user_name} ({user_id}). Reason: Activity random pass ({state.bot_activity_percentage}%)")
+            else:
+                logger.debug(f"Skipping group msg from {user_id} due to activity check fail ({state.bot_activity_percentage}%).")
 
         if should_reply:
             style = await _get_effective_style(chat_id, user_id, user_name, chat_type)
@@ -486,7 +499,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Проверка активности для групп
     if chat_type != 'private' and not should_process_message():
-        logger.debug(f"Photo from {user_id} skipped (activity {bot_activity_percentage}%). Saving info.")
+        logger.debug(f"Photo from {user_id} skipped (activity {state.bot_activity_percentage}%). Saving info.")
         # Сохраняем инфо о фото, даже если не отвечаем
         await save_message_and_embed(history_key, USER_ROLE, history_message, display_user_name_photo)
         return
@@ -499,8 +512,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _process_photo_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Внутренняя функция для асинхронной обработки фото."""
-    # Переносим получение user, chat и т.д. сюда, т.к. update может устареть
     user = update.effective_user; chat = update.effective_chat
     if not user or not chat or not update.message or not update.message.photo: return
     user_id = user.id; chat_id = chat.id; chat_type = chat.type
@@ -511,66 +522,67 @@ async def _process_photo_reply(update: Update, context: ContextTypes.DEFAULT_TYP
     history_message = "Получено фото" + (f" с подписью: '{caption}'" if caption else "")
     reply_to_message_id = update.message.message_id if chat_type != 'private' else None
 
+    # --- Скачиваем фото ---
+    photo_file = await update.message.photo[-1].get_file()
+    image_bytearray = await photo_file.download_as_bytearray()
+    image_bytes = bytes(image_bytearray)
+
+    # --- Получаем провайдера и вызываем vision ---
+    provider = get_llm_provider()
+    vision_prompt = (
+        "Опиши это изображение максимально подробно, чтобы можно было создать похожее с помощью другой нейросети (например, Kandinsky или Stable Diffusion). "
+        "Сконцентрируйся на следующих аспектах:\n"
+        "- Главный объект(ы): что это, как выглядит, поза, эмоции.\n"
+        "- Фон/Окружение: где происходит действие, важные детали.\n"
+        "- Стиль: фотореализм, иллюстрация, арт, 3D-рендер и т.д.\n"
+        "- Освещение: тип, тени, блики.\n"
+        "- Цветовая палитра: преобладающие цвета, контраст.\n"
+        "- Композиция: ракурс, план.\n"
+        "- Атмосфера/Настроение.\n"
+        "Предоставь только само описание в виде связного текста (50-150 слов), без вступлений. "
+        "Крайне важно: Итоговое описание должно быть НЕ БОЛЕЕ 990 символов. "
+        "Избегай упоминания текста на картинке."
+    )
     try:
-        photo_file = await update.message.photo[-1].get_file(); file_bytes = await photo_file.download_as_bytearray()
-        if not file_bytes: raise ValueError("Downloaded photo bytes are empty.")
-        image = Image.open(BytesIO(file_bytes)); image = image.convert('RGB')
+        description_ru = await provider.generate_any_async(vision_prompt, image_bytes=image_bytes, caption=caption)
+        filtered = filter_response(description_ru)
+        if not filtered or filtered.startswith("["):
+            await context.bot.send_message(chat_id, "Не удалось обработать изображение.", reply_to_message_id=reply_to_message_id)
+            return
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"Ошибка при обращении к Vision-провайдеру: {e}", reply_to_message_id=reply_to_message_id)
+        return
 
-        # Сохраняем информацию о фото в историю СРАЗУ
-        add_to_memory_history(history_key, USER_ROLE, history_message, display_user_name_photo)
-        await save_message_and_embed(history_key, USER_ROLE, history_message, display_user_name_photo)
+    # --- Теперь используем это описание как контекст для основного LLM ---
+    add_to_memory_history(history_key, SYSTEM_ROLE, f"[Vision-контекст]: {filtered}", display_user_name_photo)
+    await save_message_and_embed(history_key, SYSTEM_ROLE, f"[Vision-контекст]: {filtered}", display_user_name_photo)
 
-        # Остальная обработка (поиск, генерация, отправка) идет внутри этой функции
-        search_query_photo = caption if caption else "фото"
-        relevant_history_docs_photo = await asyncio.to_thread(search_relevant_history_sync, history_key, search_query_photo)
-        relevant_facts_docs_photo = await asyncio.to_thread(search_relevant_facts_sync, history_key, search_query_photo)
-
-        style = await _get_effective_style(chat_id, user_id, user_name, chat_type)
-        sys_msg = f"{style} Ты - {settings.BOT_NAME}. Комментируй изображение."
-        topic = await asyncio.to_thread(get_user_topic_from_db, user_id); topic_ctx = f"Тема: {topic}." if topic else ""
-        history_deque = chat_history.get(history_key, deque(maxlen=settings.MAX_HISTORY))
-
-        vision_prompt_text = prompt_builder.build_prompt(
-            history_deque=history_deque, relevant_history=relevant_history_docs_photo,
-            relevant_facts=relevant_facts_docs_photo, user_name=user_name,
-            current_message_text=history_message, system_message_base=sys_msg,
-            topic_context=topic_ctx
-        )
-        # Формируем финальный промпт для Vision модели
-        vision_prompt_lines = vision_prompt_text.splitlines()
-        if len(vision_prompt_lines) > 1:
-             # Убираем последнюю строку с приглашением ":", если она есть
-             if vision_prompt_lines[-1].strip().endswith(":"):
-                 vision_prompt_core = "\n".join(vision_prompt_lines[:-1])
-             else:
-                 vision_prompt_core = "\n".join(vision_prompt_lines)
-        else:
-             vision_prompt_core = vision_prompt_text
-
-        # Добавляем конкретную инструкцию для Vision
-        vision_instruction = "\nПрокомментируй приложенное изображение, учитывая предоставленный контекст беседы."
-        final_vision_prompt = vision_prompt_core + vision_instruction
+    history_deque = chat_history.get(history_key, deque(maxlen=settings.MAX_HISTORY))
+    user_message = caption if caption else "Фото без подписи"
+    sys_msg = f"На фото: {filtered}\n{settings.DEFAULT_STYLE} Ты - {settings.BOT_NAME}. Прокомментируй фото для пользователя."
+    prompt_llm = prompt_builder.build_prompt(
+        history_deque=history_deque,
+        relevant_history=[],
+        relevant_facts=[],
+        user_name=user_name,
+        current_message_text=user_message,
+        system_message_base=sys_msg,
+        topic_context=""
+    )
+    response_llm = await generate_with_cache(prompt_llm)
+    response_llm_filtered = filter_response(response_llm)
+    if response_llm_filtered:
+        add_to_memory_history(history_key, ASSISTANT_ROLE, response_llm_filtered)
+        await save_message_and_embed(history_key, ASSISTANT_ROLE, response_llm_filtered)
+        await context.bot.send_message(chat_id, response_llm_filtered, reply_to_message_id=reply_to_message_id)
+    else:
+        await context.bot.send_message(chat_id, "Не удалось сгенерировать ответ.", reply_to_message_id=reply_to_message_id)
 
 
-        contents = [final_vision_prompt, image]
-        # Используем генерацию без кэша/метрик для Vision, т.к. входные данные другие
-        response_text = await generate_vision_content_async(contents)
-        filtered = filter_response(response_text)
 
-        if filtered and not filtered.startswith("["):
-            add_to_memory_history(history_key, ASSISTANT_ROLE, filtered)
-            await save_message_and_embed(history_key, ASSISTANT_ROLE, filtered)
-            await context.bot.send_message(chat_id, filtered, reply_to_message_id=reply_to_message_id)
-        elif filtered.startswith("["):
-            reply_text = "Не удалось обработать изображение.";
-            if "blocked" in filtered.lower(): reply_text = "Ответ на изображение заблокирован."
-            await context.bot.send_message(chat_id, reply_text, reply_to_message_id=reply_to_message_id)
-        else:
-            reply_text = "Не могу ничего сказать об этом изображении."
-            await context.bot.send_message(chat_id, reply_text, reply_to_message_id=reply_to_message_id)
-    except Exception as inner_e:
-         logger.error(f"Error in _process_photo_reply for {user_id} in {chat_id}: {inner_e}", exc_info=True)
-         # Попытка отправить сообщение об ошибке пользователю
-         try: await context.bot.send_message(chat_id, "Произошла внутренняя ошибка при обработке фото.", reply_to_message_id=reply_to_message_id)
-         except Exception: pass # Игнорируем ошибки отправки
+# --- Переназначение обработчиков ---
+# Оставляем универсальный для текста/голоса/видео
 handle_message = handle_text_voice_video
+# handle_voice_message = handle_text_voice_video # Можно удалить, т.к. handle_message ловит filter.VOICE
+# handle_video_note_message = handle_text_voice_video # Можно удалить, т.к. handle_message ловит filter.VIDEO_NOTE
+# Новый обработчик документов будет зарегистрирован отдельно в main.py

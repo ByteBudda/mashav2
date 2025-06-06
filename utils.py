@@ -377,10 +377,10 @@ async def cleanup_audio_files_job(context):
 
 # --- Проверка активности бота (без изменений) ---
 def should_process_message() -> bool:
-    from state import bot_activity_percentage
-    if bot_activity_percentage >= 100: return True
-    if bot_activity_percentage <= 0: return False
-    return random.randint(1, 100) <= bot_activity_percentage
+    import state
+    if state.bot_activity_percentage >= 100: return True
+    if state.bot_activity_percentage <= 0: return False
+    return random.randint(1, 100) <= state.bot_activity_percentage
 
 class LoadBalancer:
     def __init__(self):
