@@ -21,3 +21,4 @@ reportlab
 requests
 together
 typing
+sentence_transformers
