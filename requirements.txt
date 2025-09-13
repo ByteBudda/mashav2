@@ -23,3 +23,4 @@ together
 typing
 sentence_transformers
 SpeechRecognition
+groq
